@@ -1,0 +1,9 @@
+# 可重跑生成的缓存与日志（不纳入版本历史）
+/download/
+/logs/
+*.part
+*.tmp
+
+# 系统杂项
+Thumbs.db
+Desktop.ini

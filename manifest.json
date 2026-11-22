@@ -1,0 +1,52 @@
+{
+  "createdAt": "2026-11-22 21:40:24 +08:00",
+  "machine": "WENJE",
+  "os": "Microsoft Windows 10.0.26200",
+  "gnirehtetVersion": "2.5.1",
+  "archives": [
+    {
+      "file": "gnirehtet-rust-win64-v2.5.1.zip",
+      "url": "https://github.com/Genymobile/gnirehtet/releases/download/v2.5.1/gnirehtet-rust-win64-v2.5.1.zip",
+      "bytes": 891262,
+      "sha256": "7f5b1063e7895182aa60def1437e50363c3758144088dcd079037bb7c3c46a1c"
+    },
+    {
+      "file": "platform-tools-latest-windows.zip",
+      "url": "https://dl.google.com/android/repository/platform-tools-latest-windows.zip",
+      "bytes": 8188601,
+      "sha256": "89d108360a3bf2924d3bea837239edaccc22fd6ff5befd3787c4348a9fe4f09d"
+    }
+  ],
+  "tools": [
+    {
+      "file": "adb.exe",
+      "bytes": 8659608,
+      "sha256": "bae5ce98846b19caa74a34900850caa8b21d01976932b2ad83baeb5de5651aee"
+    },
+    {
+      "file": "AdbWinApi.dll",
+      "bytes": 108184,
+      "sha256": "ed20abfb8b423029a2278d3947c1a1235774afd1b0e0e08405591e6f1d237a49"
+    },
+    {
+      "file": "AdbWinUsbApi.dll",
+      "bytes": 73368,
+      "sha256": "ac658211ac7991ce581f4f2efff86358abdca8eb1bc0f38d7686cbf4215f7c1f"
+    },
+    {
+      "file": "gnirehtet-run.cmd",
+      "bytes": 28,
+      "sha256": "d6f5fa61274fae5a47490896a75b8ba72b1f0bd5cf7d458fcdfac1c192c223b5"
+    },
+    {
+      "file": "gnirehtet.apk",
+      "bytes": 23904,
+      "sha256": "c1ac2b869a48e3c836046aac5a168f3ade510288f3304a87ddb671315c564b9a"
+    },
+    {
+      "file": "gnirehtet.exe",
+      "bytes": 2991788,
+      "sha256": "d5daefbb48143fbc2b01f24be79135fc11959fe4553b00f5a454801ed5ff720d"
+    }
+  ]
+}

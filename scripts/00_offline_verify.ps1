@@ -1,0 +1,411 @@
+<#
+.SYNOPSIS
+    gnirehtet 反向 USB 工具包离线验收（只读）。
+
+.DESCRIPTION
+    只做检查，不启动隧道、不连接手机、不改防火墙、不改路由、不杀进程。
+    检查项：
+      1. 目录结构
+      2. 必需文件（大小 + SHA256），并与 manifest.json 比对
+      3. adb version（本地执行，不启动 adb server）
+      4. TCP 31416 占用情况（含占用进程）
+      5. 现有防火墙规则（按名称 gnirehtet / 按端口 31416 查询）
+      6. 脚本语法解析
+      7. 环境预检（与其它服务的干扰风险，见 lib\EnvCheck.ps1）
+    结果写入 logs\offline-verify-<时间戳>.txt（UTF-8）。
+
+.PARAMETER Root
+    包根目录，默认 C:\Users\wen\gnirehtet-package。
+
+.PARAMETER SkipFirewallScan
+    跳过防火墙规则扫描（规则很多、CIM 较慢时使用）。
+
+.PARAMETER LogFile
+    自定义日志路径，默认 logs\offline-verify-yyyyMMdd-HHmmss.txt。
+
+.NOTES
+    退出码：0 = 全部通过；2 = 包本身有阻断项（缺文件 / adb 异常 / 端口占用 / 语法错误）；
+            3 = 包通过但环境未就绪（有会与其他服务互相干扰的因素）。
+#>
+[CmdletBinding()]
+param(
+    [string]$Root = 'C:\Users\wen\gnirehtet-package',
+    [switch]$SkipFirewallScan,
+    [string]$LogFile
+)
+
+$ErrorActionPreference = 'Continue'
+
+$ToolsDir  = Join-Path $Root 'tools\gnirehtet'
+$LogsDir   = Join-Path $Root 'logs'
+$ScriptsDir = Join-Path $Root 'scripts'
+$ManifestPath = Join-Path $Root 'manifest.json'
+
+if (-not $LogFile) {
+    $LogFile = Join-Path $LogsDir ('offline-verify-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.txt')
+}
+New-Item -ItemType Directory -Force -Path $LogsDir | Out-Null
+
+$script:Lines  = New-Object System.Collections.Generic.List[string]
+$script:Checks = New-Object System.Collections.Generic.List[object]
+
+function Add-Line {
+    param([string]$Text = '')
+    $script:Lines.Add($Text)
+    Write-Host $Text
+}
+
+function Add-Section {
+    param([string]$Title)
+    Add-Line ''
+    Add-Line ('=' * 72)
+    Add-Line $Title
+    Add-Line ('=' * 72)
+}
+
+function Add-Check {
+    param(
+        [string]$Name,
+        [ValidateSet('PASS', 'WARN', 'FAIL', 'INFO')]
+        [string]$Status,
+        [string]$Detail = '',
+        [switch]$Blocking
+    )
+    $script:Checks.Add([pscustomobject]@{
+        Name     = $Name
+        Status   = $Status
+        Detail   = $Detail
+        Blocking = [bool]$Blocking
+    })
+    $tag = switch ($Status) {
+        'PASS' { '[PASS]' }
+        'WARN' { '[WARN]' }
+        'FAIL' { '[FAIL]' }
+        'INFO' { '[INFO]' }
+    }
+    Add-Line ('{0} {1}{2}' -f $tag, $Name, $(if ($Detail) { ' —— ' + $Detail } else { '' }))
+}
+
+function Invoke-Captured {
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments = @(),
+        [int]$TimeoutSeconds = 20
+    )
+    $outFile = Join-Path $env:TEMP ('ov-out-' + [guid]::NewGuid().ToString('N') + '.txt')
+    $errFile = Join-Path $env:TEMP ('ov-err-' + [guid]::NewGuid().ToString('N') + '.txt')
+    $result = [pscustomobject]@{ ExitCode = $null; StdOut = ''; StdErr = ''; TimedOut = $false }
+    try {
+        $p = Start-Process -FilePath $FilePath -ArgumentList $Arguments -NoNewWindow -PassThru `
+            -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+        if (-not $p.WaitForExit($TimeoutSeconds * 1000)) {
+            $result.TimedOut = $true
+            try { $p.Kill() } catch { }
+        } else {
+            $result.ExitCode = $p.ExitCode
+        }
+        if (Test-Path -LiteralPath $outFile) { $result.StdOut = (Get-Content -LiteralPath $outFile -Raw -Encoding utf8) }
+        if (Test-Path -LiteralPath $errFile) { $result.StdErr = (Get-Content -LiteralPath $errFile -Raw -Encoding utf8) }
+    } catch {
+        $result.StdErr = $_.Exception.Message
+    } finally {
+        Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
+    }
+    $result
+}
+
+try {
+    # ------------------------------------------------------------ 头部
+    $elevated = ([Security.Principal.WindowsPrincipal] `
+        [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator)
+
+    Add-Line 'gnirehtet 反向 USB 工具包 —— 离线验收报告'
+    Add-Line ('生成时间   : ' + (Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz'))
+    Add-Line ('计算机名   : ' + $env:COMPUTERNAME)
+    Add-Line ('当前用户   : ' + $env:USERNAME + $(if ($elevated) { '（已提权）' } else { '（未提权）' }))
+    Add-Line ('包根目录   : ' + $Root)
+    Add-Line ('日志文件   : ' + $LogFile)
+    Add-Line ('PowerShell : ' + $PSVersionTable.PSVersion.ToString())
+    Add-Line ('操作系统   : ' + [System.Runtime.InteropServices.RuntimeInformation]::OSDescription.Trim())
+    Add-Line ('进程位数   : ' + $(if ([Environment]::Is64BitProcess) { '64 位' } else { '32 位' }))
+    Add-Line '模式       : 只读验收（不连手机、不启动隧道、不改防火墙、不改路由）'
+
+    # ------------------------------------------------------------ 1 目录结构
+    Add-Section '1. 目录结构'
+    $expectedDirs = @(
+        $Root,
+        (Join-Path $Root 'download'),
+        (Join-Path $Root 'logs'),
+        (Join-Path $Root 'scripts'),
+        (Join-Path $Root 'tools'),
+        $ToolsDir
+    )
+    foreach ($d in $expectedDirs) {
+        if (Test-Path -LiteralPath $d -PathType Container) {
+            Add-Line ('[PASS] 目录存在：' + $d)
+        } else {
+            Add-Check -Name "目录缺失：$d" -Status FAIL -Blocking
+        }
+    }
+
+    # ------------------------------------------------------------ 2 必需文件
+    Add-Section '2. 必需文件'
+    $required = @(
+        @{ Name = 'gnirehtet.exe';    Min = 1000;  Desc = 'gnirehtet 主程序' },
+        @{ Name = 'gnirehtet.apk';    Min = 10000; Desc = 'Android 客户端 APK' },
+        @{ Name = 'adb.exe';          Min = 1000;  Desc = 'Android 调试桥' },
+        @{ Name = 'AdbWinApi.dll';    Min = 1000;  Desc = 'adb Win32 API 依赖' },
+        @{ Name = 'AdbWinUsbApi.dll'; Min = 1000;  Desc = 'adb USB 依赖' }
+    )
+
+    $fileHashes = @{}
+    foreach ($r in $required) {
+        $p = Join-Path $ToolsDir $r.Name
+        if (-not (Test-Path -LiteralPath $p -PathType Leaf)) {
+            Add-Check -Name "缺少文件 $($r.Name)" -Status FAIL -Detail $r.Desc -Blocking
+            continue
+        }
+        $item = Get-Item -LiteralPath $p
+        if ($item.Length -lt $r.Min) {
+            Add-Check -Name "文件过小 $($r.Name)" -Status FAIL -Detail "$($item.Length) 字节，$($r.Desc)" -Blocking
+            continue
+        }
+        $hash = (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant()
+        $fileHashes[$r.Name] = $hash
+        Add-Check -Name $r.Name -Status PASS -Detail ('{0} 字节  {1}  {2}' -f $item.Length, $hash.Substring(0, 16), $r.Desc)
+    }
+
+    Add-Line ''
+    Add-Line '同目录其他文件：'
+    $others = Get-ChildItem -LiteralPath $ToolsDir -File -ErrorAction SilentlyContinue |
+        Where-Object { $required.Name -notcontains $_.Name }
+    if ($others) {
+        foreach ($o in $others) { Add-Line ('  - {0,-24} {1,10} 字节' -f $o.Name, $o.Length) }
+    } else {
+        Add-Line '  （无）'
+    }
+
+    # 与 manifest 比对
+    Add-Line ''
+    if (Test-Path -LiteralPath $ManifestPath) {
+        try {
+            $manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding utf8 | ConvertFrom-Json
+            Add-Line ('构建清单   : ' + $ManifestPath)
+            Add-Line ('构建时间   : ' + $manifest.createdAt)
+            Add-Line ('构建主机   : ' + $manifest.machine)
+            Add-Line ('gnirehtet  : v' + $manifest.gnirehtetVersion)
+            $mismatch = @()
+            foreach ($t in $manifest.tools) {
+                if ($fileHashes.ContainsKey($t.file) -and $fileHashes[$t.file] -ne $t.sha256) {
+                    $mismatch += $t.file
+                }
+            }
+            if ($mismatch.Count -eq 0) {
+                Add-Check -Name 'manifest 哈希一致性' -Status PASS -Detail '已校验文件与构建清单一致'
+            } else {
+                Add-Check -Name 'manifest 哈希不一致' -Status FAIL -Detail ($mismatch -join ', ') -Blocking
+            }
+        } catch {
+            Add-Check -Name 'manifest.json 解析' -Status WARN -Detail $_.Exception.Message
+        }
+    } else {
+        Add-Check -Name 'manifest.json 缺失' -Status WARN -Detail '无法核对构建来源，建议重新运行 build_package.ps1'
+    }
+
+    # ------------------------------------------------------------ 3 adb version
+    Add-Section '3. adb version'
+    $adbPath = Join-Path $ToolsDir 'adb.exe'
+    if (-not (Test-Path -LiteralPath $adbPath)) {
+        Add-Check -Name 'adb version' -Status FAIL -Detail 'adb.exe 不存在，无法执行' -Blocking
+    } else {
+        $r = Invoke-Captured -FilePath $adbPath -Arguments @('version') -TimeoutSeconds 20
+        if ($r.TimedOut) {
+            Add-Check -Name 'adb version' -Status FAIL -Detail '执行超时（20s），未强制结束后续步骤' -Blocking
+        } elseif ($r.ExitCode -ne 0) {
+            Add-Check -Name 'adb version' -Status FAIL -Detail "退出码 $($r.ExitCode)" -Blocking
+            foreach ($l in ($r.StdErr -split "`r?`n" | Where-Object { $_.Trim() })) { Add-Line ('       ' + $l) }
+        } else {
+            $text = (($r.StdOut + $r.StdErr) -split "`r?`n" | Where-Object { $_.Trim() }) -join ' | '
+            Add-Check -Name 'adb version' -Status PASS -Detail $text
+        }
+    }
+
+    # ------------------------------------------------------------ 4 端口 31416
+    Add-Section '4. TCP 31416 占用情况'
+    # 无匹配连接时 cmdlet 会写非终止错误，用 SilentlyContinue 抑制
+    $port31416 = @(Get-NetTCPConnection -LocalPort 31416 -ErrorAction SilentlyContinue)
+
+    if ($port31416.Count -eq 0) {
+        Add-Check -Name '端口 31416' -Status PASS -Detail '当前无监听/连接，可分配'
+    } else {
+        Add-Check -Name '端口 31416 已被占用' -Status FAIL -Detail 'gnirehtet relay 默认监听此端口，需先由人工处理' -Blocking
+        foreach ($c in $port31416) {
+            $procName = ''
+            $procPath = ''
+            try {
+                $proc = Get-Process -Id $c.OwningProcess -ErrorAction Stop
+                $procName = $proc.ProcessName
+                $procPath = $proc.Path
+            } catch {
+                $procName = '（无法读取进程信息，可能为其他用户或已退出）'
+            }
+            Add-Line ('       {0}:{1} -> {2}:{3}  {4}  PID={5}  {6}' -f `
+                $c.LocalAddress, $c.LocalPort, $c.RemoteAddress, $c.RemotePort, $c.State, $c.OwningProcess, $procName)
+            if ($procPath) { Add-Line ('       可执行文件: ' + $procPath) }
+        }
+    }
+
+    # ------------------------------------------------------------ 5 防火墙
+    Add-Section '5. 现有防火墙规则（只读查询）'
+    if ($SkipFirewallScan) {
+        Add-Check -Name '防火墙规则扫描' -Status INFO -Detail '已按参数跳过'
+    } else {
+        $fwOk = $true
+        $nameRules = @()
+        $portRules = @()
+        try {
+            $allRules = @(Get-NetFirewallRule -ErrorAction Stop)
+            $nameRules = @($allRules | Where-Object { $_.DisplayName -like '*gnirehtet*' -or $_.Name -like '*gnirehtet*' })
+
+            $portFilters = @(Get-NetFirewallPortFilter -ErrorAction Stop)
+            $idsFor31416 = New-Object System.Collections.Generic.HashSet[string]
+            foreach ($pf in $portFilters) {
+                foreach ($p in @($pf.LocalPort)) {
+                    if ([string]$p -eq '31416') { [void]$idsFor31416.Add($pf.InstanceID) }
+                }
+            }
+            if ($idsFor31416.Count -gt 0) {
+                $portRules = @($allRules | Where-Object { $idsFor31416.Contains($_.InstanceID) })
+            }
+        } catch {
+            $fwOk = $false
+            Add-Check -Name '防火墙规则查询' -Status WARN -Detail ('查询受限：' + $_.Exception.Message)
+        }
+
+        if ($fwOk) {
+            Add-Line ('规则总数      : ' + $allRules.Count)
+            Add-Line ('名称含 gnirehtet : ' + $nameRules.Count + ' 条')
+            foreach ($r in $nameRules) {
+                Add-Line ('  - {0} | 启用={1} 方向={2} 动作={3}' -f $r.DisplayName, $r.Enabled, $r.Direction, $r.Action)
+            }
+            Add-Line ('匹配端口 31416 : ' + $portRules.Count + ' 条')
+            foreach ($r in $portRules) {
+                Add-Line ('  - {0} | 启用={1} 方向={2} 动作={3} 配置文件={4}' -f $r.DisplayName, $r.Enabled, $r.Direction, $r.Action, $r.Profile)
+            }
+            if ($nameRules.Count -eq 0 -and $portRules.Count -eq 0) {
+                Add-Check -Name '防火墙放行规则' -Status WARN -Detail '未发现 gnirehtet / 31416 相关规则，符合“未改动”预期；实机联调时需人工决定是否添加'
+            } else {
+                Add-Check -Name '防火墙放行规则' -Status INFO -Detail '已存在相关规则，保持原样未改动'
+            }
+            if (-not $elevated) {
+                Add-Line '提示：当前未提权，个别系统规则可能不可见，不影响“未改动”结论。'
+            }
+        }
+    }
+
+    # ------------------------------------------------------------ 6 脚本语法
+    Add-Section '6. 脚本语法检查'
+    $psFiles = @()
+    if (Test-Path -LiteralPath $ScriptsDir) {
+        $psFiles += @(Get-ChildItem -LiteralPath $ScriptsDir -Filter '*.ps1' -File -Recurse -ErrorAction SilentlyContinue)
+    }
+    if ($psFiles.Count -eq 0) {
+        Add-Check -Name '脚本语法' -Status WARN -Detail 'scripts\ 下没有 .ps1 文件'
+    } else {
+        foreach ($f in $psFiles) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$tokens, [ref]$errors)
+            if ($errors -and $errors.Count -gt 0) {
+                Add-Check -Name "语法错误：$($f.Name)" -Status FAIL -Detail "$($errors.Count) 处" -Blocking
+                foreach ($e in $errors) {
+                    Add-Line ('       L{0}: {1}' -f $e.Extent.StartLineNumber, $e.Message)
+                }
+            } else {
+                Add-Check -Name "语法 $($f.Name)" -Status PASS -Detail "解析通过（$($tokens.Count) 个 token）"
+            }
+        }
+    }
+
+    # ------------------------------------------------------------ 7 环境预检
+    Add-Section '7. 环境预检（是否与其他服务互相干扰）'
+    $envPre = $null
+    $libPath = Join-Path $ScriptsDir 'lib\EnvCheck.ps1'
+    if (Test-Path -LiteralPath $libPath) {
+        try {
+            . $libPath
+            $envPre = Invoke-EnvPreflight -Root $Root
+            foreach ($sev in @('BLOCKER', 'WARN', 'INFO')) {
+                foreach ($f in $envPre.Findings | Where-Object Severity -eq $sev) {
+                    foreach ($l in (Format-EnvFinding -Finding $f)) { Add-Line $l }
+                }
+            }
+            $envStatus = if ($envPre.Blockers -gt 0) { 'FAIL' } elseif ($envPre.Warnings -gt 0) { 'WARN' } else { 'PASS' }
+            Add-Check -Name '环境就绪度' -Status $envStatus `
+                -Detail ("阻断 {0} 项 / 注意 {1} 项 / 信息 {2} 项" -f $envPre.Blockers, $envPre.Warnings, $envPre.Infos)
+        } catch {
+            Add-Check -Name '环境预检' -Status WARN -Detail ('执行失败：' + $_.Exception.Message)
+        }
+    } else {
+        Add-Check -Name '环境预检库缺失' -Status WARN -Detail "缺少 $libPath，跳过干扰检查"
+    }
+
+    $drive = (Get-Item -LiteralPath $Root).PSDrive
+    if ($drive -and $drive.Free) {
+        $freeGb = [math]::Round($drive.Free / 1GB, 2)
+        $status = if ($freeGb -lt 1) { 'WARN' } else { 'INFO' }
+        Add-Check -Name '磁盘剩余空间' -Status $status -Detail ("{0}: {1} GB 可用" -f $drive.Name, $freeGb)
+    }
+
+    # ------------------------------------------------------------ 汇总
+    Add-Section '8. 汇总'
+    $pass = @($script:Checks | Where-Object Status -eq 'PASS').Count
+    $warn = @($script:Checks | Where-Object Status -eq 'WARN').Count
+    $fail = @($script:Checks | Where-Object Status -eq 'FAIL').Count
+    $blocking = @($script:Checks | Where-Object { $_.Status -eq 'FAIL' -and $_.Blocking }).Count
+    $envBlockers = if ($envPre) { $envPre.Blockers } else { 0 }
+    $envWarns = if ($envPre) { $envPre.Warnings } else { 0 }
+
+    Add-Line ("PASS {0} 项 / WARN {1} 项 / FAIL {2} 项" -f $pass, $warn, $fail)
+    Add-Line ("其中：包完整性阻断 {0} 项，环境干扰阻断 {1} 项" -f $blocking, $envBlockers)
+    if ($fail -gt 0) {
+        Add-Line ''
+        Add-Line '未通过项：'
+        foreach ($c in $script:Checks | Where-Object { $_.Status -eq 'FAIL' }) {
+            Add-Line ('  - ' + $c.Name + $(if ($c.Detail) { '：' + $c.Detail } else { '' }))
+        }
+    }
+    if ($warn -gt 0) {
+        Add-Line ''
+        Add-Line '需关注项：'
+        foreach ($c in $script:Checks | Where-Object { $_.Status -eq 'WARN' }) {
+            Add-Line ('  - ' + $c.Name + $(if ($c.Detail) { '：' + $c.Detail } else { '' }))
+        }
+    }
+    Add-Line ''
+    if ($blocking -gt 0) {
+        Add-Line '结论：未通过（包本身存在阻断项，需人工处理后重跑本脚本）'
+        $script:ExitCode = 2
+    } elseif ($envBlockers -gt 0) {
+        Add-Line ('结论：包通过，但环境未就绪（{0} 项阻断）。先跑 10_env_preflight.ps1 处理环境，再进入实机。' -f $envBlockers)
+        $script:ExitCode = 3
+    } else {
+        Add-Line '结论：通过（离线准备完成，环境无阻断，可进入实机验证阶段）'
+        $script:ExitCode = 0
+    }
+}
+catch {
+    Add-Line ''
+    Add-Line ('[FAIL] 验收脚本异常中止：' + $_.Exception.Message)
+    Add-Line ($_.ScriptStackTrace)
+    $script:ExitCode = 2
+}
+finally {
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllLines($LogFile, $script:Lines, $utf8)
+    Write-Host ''
+    Write-Host ('日志已写入：' + $LogFile)
+}
+
+exit $(if ($null -ne $script:ExitCode) { $script:ExitCode } else { 2 })
