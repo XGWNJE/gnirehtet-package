@@ -15,7 +15,7 @@
     结果写入 logs\offline-verify-<时间戳>.txt（UTF-8）。
 
 .PARAMETER Root
-    包根目录，默认 C:\Users\wen\gnirehtet-package。
+    包根目录，默认取脚本所在包的根目录（整包可移动，无需指定）。
 
 .PARAMETER SkipFirewallScan
     跳过防火墙规则扫描（规则很多、CIM 较慢时使用）。
@@ -29,12 +29,15 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Root = 'C:\Users\wen\gnirehtet-package',
+    [string]$Root = '',
     [switch]$SkipFirewallScan,
     [string]$LogFile
 )
 
 $ErrorActionPreference = 'Continue'
+
+# 绿色版：不带参数时以包自身位置为准，整个目录可以随意搬动
+if (-not $Root) { $Root = Split-Path -Parent $PSScriptRoot }
 
 $ToolsDir  = Join-Path $Root 'tools\gnirehtet'
 $LogsDir   = Join-Path $Root 'logs'
@@ -133,19 +136,28 @@ try {
 
     # ------------------------------------------------------------ 1 目录结构
     Add-Section '1. 目录结构'
-    $expectedDirs = @(
+    # 必需目录：缺了就没法用
+    $requiredDirs = @(
         $Root,
-        (Join-Path $Root 'download'),
-        (Join-Path $Root 'logs'),
         (Join-Path $Root 'scripts'),
         (Join-Path $Root 'tools'),
         $ToolsDir
     )
-    foreach ($d in $expectedDirs) {
+    foreach ($d in $requiredDirs) {
         if (Test-Path -LiteralPath $d -PathType Container) {
             Add-Line ('[PASS] 目录存在：' + $d)
         } else {
             Add-Check -Name "目录缺失：$d" -Status FAIL -Blocking
+        }
+    }
+
+    # 可选目录：绿色包里可能还没生成，运行时自动创建，不算问题
+    foreach ($name in 'download', 'logs') {
+        $d = Join-Path $Root $name
+        if (Test-Path -LiteralPath $d -PathType Container) {
+            Add-Line ('[PASS] 目录存在：' + $d)
+        } else {
+            Add-Line ('[INFO] 可选目录未生成：' + $d + '（首次运行会自动创建）')
         }
     }
 

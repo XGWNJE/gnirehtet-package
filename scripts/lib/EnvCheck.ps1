@@ -11,8 +11,17 @@
 
 $script:SeverityRank = @{ 'BLOCKER' = 0; 'WARN' = 1; 'INFO' = 2 }
 
+function Resolve-PackageRoot {
+    param([string]$Root)
+    if ($Root) { return $Root }
+    # 默认取“正在运行的脚本”所在包的根目录，整包可以随意搬动
+    if ($PSCommandPath) { return (Split-Path -Parent (Split-Path -Parent $PSCommandPath)) }
+    return (Get-Location).Path
+}
+
 function Get-GnirehtetPaths {
-    param([string]$Root = 'C:\Users\wen\gnirehtet-package')
+    param([string]$Root = '')
+    $Root = Resolve-PackageRoot -Root $Root
     [pscustomobject]@{
         Root        = $Root
         ToolsDir    = Join-Path $Root 'tools\gnirehtet'
@@ -167,7 +176,8 @@ function Test-SamePath {
       - 本包自己的残留进程
 #>
 function Invoke-EnvPreflight {
-    param([string]$Root = 'C:\Users\wen\gnirehtet-package')
+    param([string]$Root = '')
+    $Root = Resolve-PackageRoot -Root $Root
 
     $p = Get-GnirehtetPaths -Root $Root
     $findings = New-Object System.Collections.Generic.List[object]

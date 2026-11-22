@@ -7,7 +7,7 @@
 ## 目录结构
 
 ```
-C:\Users\wen\gnirehtet-package\
+gnirehtet-package\            ← 绿色包，整个文件夹放哪都能跑
 ├─ scripts\
 │  ├─ build_package.ps1      下载 + 解压 + 合并 adb 三件套，生成 manifest.json
 │  ├─ 00_offline_verify.ps1  离线验收：文件、adb version、31416、防火墙、语法、环境
@@ -22,9 +22,19 @@ C:\Users\wen\gnirehtet-package\
 └─ manifest.json             版本、大小、SHA256 清单
 ```
 
+## 绿色版说明
+
+- **放哪都能跑**：脚本按自身位置定位包目录，没有写死任何绝对路径。整个文件夹可以随便移动、改名、复制到 U 盘。
+- **不写系统**：不写注册表、不改系统环境变量、不加 PATH、不改路由和防火墙。只在本次进程内临时置顶自己的 adb。
+- **产物都在包内**：日志写 `logs\`，下载缓存在 `download\`，清单是 `manifest.json`。
+- **删掉即卸载**：把文件夹删了就没有残留（除非你自己用 `-Fix` 关过别人的服务，那本来就该由你决定）。
+
+唯一的外部依赖：PowerShell 7（`pwsh`）。如果只有系统自带的 5.1，中文提示可能变成乱码，功能仍可用。
+
 ## 推荐流程
 
 ```powershell
+cd <包目录>                                                  # 例如 D:\tools\gnirehtet-package
 pwsh -NoProfile -File scripts\build_package.ps1              # 1. 准备
 pwsh -NoProfile -File scripts\00_offline_verify.ps1          # 2. 验收（只读）
 pwsh -NoProfile -File scripts\10_env_preflight.ps1           # 3. 体检（只读）
@@ -109,6 +119,7 @@ adb 客户端拉起常驻 server 时，会把调用方的句柄表复制给 serv
 - 交互处置实测：假占用进程占 31416 → 选 1 + 确认 → 进程关闭、端口释放；同轮 5037 未被触碰。
 - 设备逻辑实测（假 adb）：0 台提示、1 台自动选、3 台中排除未授权、编号越界回退第 1 台。
 - 端到端实测：隔离端口 5099 上跑 `-Action status`，6.8 秒返回“没找到手机”三件套提示，收尾后 5037 仍是 PID 4940。
+- 绿色版实测：整包复制到 `...\opencode\便携 测试\gnirehtet-package`（路径含空格与中文）后，体检、验收、入口、`-Action status` 全部正常，日志写在副本自己的 `logs\` 下，5037 未受影响。
 
 ## 待实机验证
 

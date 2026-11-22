@@ -11,7 +11,8 @@
 #>
 
 function Get-InterferenceTargets {
-    param([string]$Root = 'C:\Users\wen\gnirehtet-package')
+    param([string]$Root = '')
+    $Root = Resolve-PackageRoot -Root $Root
 
     $p = Get-GnirehtetPaths -Root $Root
     $pkgVer = Get-AdbVersionInfo -Exe $p.AdbExe
@@ -105,10 +106,11 @@ function Get-InterferenceTargets {
 function Stop-InterferenceTarget {
     param(
         [Parameter(Mandatory)] $Target,
-        [string]$Root = 'C:\Users\wen\gnirehtet-package',
+        [string]$Root = '',
         [switch]$DryRun
     )
 
+    $Root = Resolve-PackageRoot -Root $Root
     $p = Get-GnirehtetPaths -Root $Root
     $result = [pscustomobject]@{ Ok = $false; Message = ''; Respawned = $false }
 

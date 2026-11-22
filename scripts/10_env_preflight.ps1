@@ -13,7 +13,7 @@
     脚本永远不会自动执行安装、启动隧道、改防火墙、改路由。
 
 .PARAMETER Root
-    工具包根目录，默认 C:\Users\wen\gnirehtet-package。
+    包根目录，默认取脚本所在包的根目录（整包可移动，无需指定）。
 
 .PARAMETER Apply
     只清理本包自身残留，不碰别人的服务。
@@ -36,7 +36,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Root = 'C:\Users\wen\gnirehtet-package',
+    [string]$Root = '',
     [switch]$Apply,
     [switch]$Fix,
     [switch]$DryRun,
@@ -45,6 +45,9 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
+
+# 绿色版：不带参数时以包自身位置为准，整个目录可以随意搬动
+if (-not $Root) { $Root = Split-Path -Parent $PSScriptRoot }
 $here = Split-Path -Parent $PSCommandPath
 . (Join-Path $here 'lib\EnvCheck.ps1')
 . (Join-Path $here 'lib\EnvFix.ps1')

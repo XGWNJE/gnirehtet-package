@@ -13,7 +13,7 @@
     ！本脚本不会执行 adb、不会启动 gnirehtet、不会修改系统网络配置。
 
 .PARAMETER Root
-    包根目录，默认 C:\Users\wen\gnirehtet-package。
+    包根目录，默认取脚本所在包的根目录（整包可移动，无需指定）。
 
 .PARAMETER Force
     忽略已下载的压缩包，强制重新下载。
@@ -26,12 +26,15 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Root = 'C:\Users\wen\gnirehtet-package',
+    [string]$Root = '',
     [switch]$Force,
     [switch]$SkipDownload
 )
 
 $ErrorActionPreference = 'Stop'
+
+# 绿色版：不带参数时以包自身位置为准，整个目录可以随意搬动
+if (-not $Root) { $Root = Split-Path -Parent $PSScriptRoot }
 
 $GnirehtetVersion = '2.5.1'
 $GnirehtetUrl     = "https://github.com/Genymobile/gnirehtet/releases/download/v$GnirehtetVersion/gnirehtet-rust-win64-v$GnirehtetVersion.zip"

@@ -17,7 +17,7 @@
     preflight（默认）| status | install | run | stop
 
 .PARAMETER Root
-    包根目录，默认 C:\Users\wen\gnirehtet-package。
+    包根目录，默认取脚本所在包的根目录（整包可移动，无需指定）。
 
 .PARAMETER Serial
     设备序列号；有多台设备时用它指定，避免被问。
@@ -39,13 +39,16 @@
 param(
     [ValidateSet('preflight', 'status', 'install', 'run', 'stop')]
     [string]$Action = 'preflight',
-    [string]$Root = 'C:\Users\wen\gnirehtet-package',
+    [string]$Root = '',
     [string]$Serial,
     [switch]$Yes,
     [switch]$Force
 )
 
 $ErrorActionPreference = 'Stop'
+
+# 绿色版：不带参数时以包自身位置为准，整个目录可以随意搬动
+if (-not $Root) { $Root = Split-Path -Parent $PSScriptRoot }
 $here = Split-Path -Parent $PSCommandPath
 . (Join-Path $here 'lib\EnvCheck.ps1')
 . (Join-Path $here 'lib\AdbDevices.ps1')
