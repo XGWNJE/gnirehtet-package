@@ -36,12 +36,14 @@ param(
 
 $ErrorActionPreference = 'Continue'
 
-# 绿色版：不带参数时以包自身位置为准，整个目录可以随意搬动
-if (-not $Root) { $Root = Split-Path -Parent $PSScriptRoot }
+# 绿色版：兼容 PowerShell 2.0 ~ 7.x，不带参数时以包自身位置为准
+$script:VerifyDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+if (-not $Root) { $Root = Split-Path -Parent $script:VerifyDir }
 
-$ToolsDir  = Join-Path $Root 'tools\gnirehtet'
-$LogsDir   = Join-Path $Root 'logs'
-$ScriptsDir = Join-Path $Root 'scripts'
+$ToolsDir     = Join-Path $Root 'tools\gnirehtet'
+$DepsDir      = Join-Path $Root 'deps'
+$LogsDir      = Join-Path $Root 'logs'
+$ScriptsDir   = Join-Path $Root 'scripts'
 $ManifestPath = Join-Path $Root 'manifest.json'
 $EnvLibPath = Join-Path $ScriptsDir 'lib\EnvCheck.ps1'
 $script:EnvLibLoaded = $false
@@ -108,12 +110,12 @@ function Add-Check {
         [string]$Detail = '',
         [switch]$Blocking
     )
-    $script:Checks.Add([pscustomobject]@{
+    $script:Checks.Add((New-Object PSObject -Property @{
         Name     = $Name
         Status   = $Status
         Detail   = $Detail
         Blocking = [bool]$Blocking
-    })
+    }))
     $tag = switch ($Status) {
         'PASS' { '[PASS]' }
         'WARN' { '[WARN]' }
@@ -131,18 +133,20 @@ function Invoke-Captured {
     )
     $outFile = Join-Path $env:TEMP ('ov-out-' + [guid]::NewGuid().ToString('N') + '.txt')
     $errFile = Join-Path $env:TEMP ('ov-err-' + [guid]::NewGuid().ToString('N') + '.txt')
-    $result = [pscustomobject]@{ ExitCode = $null; StdOut = ''; StdErr = ''; TimedOut = $false }
+    $result = New-Object PSObject -Property @{ ExitCode = $null; StdOut = ''; StdErr = ''; TimedOut = $false }
     try {
         $p = Start-Process -FilePath $FilePath -ArgumentList $Arguments -NoNewWindow -PassThru `
             -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+        $null = $p.Handle
         if (-not $p.WaitForExit($TimeoutSeconds * 1000)) {
             $result.TimedOut = $true
             try { $p.Kill() } catch { }
         } else {
+            $p.WaitForExit()
             $result.ExitCode = $p.ExitCode
         }
-        if (Test-Path -LiteralPath $outFile) { $result.StdOut = (Get-Content -LiteralPath $outFile -Raw -Encoding utf8) }
-        if (Test-Path -LiteralPath $errFile) { $result.StdErr = (Get-Content -LiteralPath $errFile -Raw -Encoding utf8) }
+        if (Test-Path -LiteralPath $outFile) { $result.StdOut = [System.IO.File]::ReadAllText($outFile, [System.Text.Encoding]::UTF8) }
+        if (Test-Path -LiteralPath $errFile) { $result.StdErr = [System.IO.File]::ReadAllText($errFile, [System.Text.Encoding]::UTF8) }
     } catch {
         $result.StdErr = $_.Exception.Message
     } finally {
@@ -175,7 +179,8 @@ try {
         $Root,
         (Join-Path $Root 'scripts'),
         (Join-Path $Root 'tools'),
-        $ToolsDir
+        $ToolsDir,
+        $DepsDir
     )
     foreach ($d in $requiredDirs) {
         if (Test-Path -LiteralPath $d -PathType Container) {
@@ -222,10 +227,37 @@ try {
         Add-Check -Name $r.Name -Status PASS -Detail ('{0} 字节  {1}  {2}' -f $item.Length, $hash.Substring(0, 16), $r.Desc)
     }
 
+    # 检查根目录唯一入口与 Win7 离线依赖
+    $entryBat = Join-Path $Root 'gnirehtet.bat'
+    if (Test-Path -LiteralPath $entryBat -PathType Leaf) {
+        Add-Check -Name 'gnirehtet.bat' -Status PASS -Detail '根目录唯一入口存在'
+    } else {
+        Add-Check -Name '缺少根目录入口 gnirehtet.bat' -Status FAIL -Blocking
+    }
+
+    $depRequired = @(
+        @{ Rel = 'vc_redist.x86.exe'; Min = 5000000; Desc = '微软 VC++ 2015-2022 x86 运行库（Win7 UCRT）' },
+        @{ Rel = 'UniversalAdbDriverSetup.msi'; Min = 1000000; Desc = '通用 Android ADB USB 驱动' },
+        @{ Rel = 'google-usb-driver\android_winusb.inf'; Min = 1000; Desc = 'Google 官方 USB 驱动 INF' }
+    )
+    foreach ($dr in $depRequired) {
+        $dp = Join-Path $DepsDir $dr.Rel
+        if (-not (Test-Path -LiteralPath $dp -PathType Leaf)) {
+            Add-Check -Name "缺少离线依赖 deps\$($dr.Rel)" -Status FAIL -Detail $dr.Desc -Blocking
+            continue
+        }
+        $dItem = Get-Item -LiteralPath $dp
+        if ($dItem.Length -lt $dr.Min) {
+            Add-Check -Name "离线依赖过小 deps\$($dr.Rel)" -Status FAIL -Detail "$($dItem.Length) 字节，$($dr.Desc)" -Blocking
+            continue
+        }
+        Add-Check -Name "deps\$($dr.Rel)" -Status PASS -Detail ('{0} 字节  {1}' -f $dItem.Length, $dr.Desc)
+    }
+
     Add-Line ''
     Add-Line '同目录其他文件：'
-    $others = Get-ChildItem -LiteralPath $ToolsDir -File -ErrorAction SilentlyContinue |
-        Where-Object { $required.Name -notcontains $_.Name }
+    $others = Get-ChildItem -LiteralPath $ToolsDir -ErrorAction SilentlyContinue |
+        Where-Object { -not $_.PSIsContainer -and ($required.Name -notcontains $_.Name) }
     if ($others) {
         foreach ($o in $others) { Add-Line ('  - {0,-24} {1,10} 字节' -f $o.Name, $o.Length) }
     } else {
@@ -235,8 +267,12 @@ try {
     # 与 manifest 比对
     Add-Line ''
     if (Test-Path -LiteralPath $ManifestPath) {
+        if (-not (Get-Command ConvertFrom-Json -ErrorAction SilentlyContinue)) {
+            Add-Check -Name 'manifest.json 比对' -Status INFO -Detail 'PowerShell 2.0 无 ConvertFrom-Json，跳过 JSON 解析比对'
+        } else {
         try {
-            $manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding utf8 | ConvertFrom-Json
+            $manifestRaw = [System.IO.File]::ReadAllText($ManifestPath, [System.Text.Encoding]::UTF8)
+            $manifest = $manifestRaw | ConvertFrom-Json
             Add-Line ('构建清单   : ' + $ManifestPath)
             Add-Line ('构建时间   : ' + $manifest.createdAt)
             if ($manifest.machine) { Add-Line ('构建主机   : ' + $manifest.machine) }
@@ -264,7 +300,7 @@ try {
                     if ($oHash -ne $manifestMap[$o.Name]) {
                         $mismatch += $o.Name
                     }
-                } elseif ($o.Extension -in @('.exe', '.dll', '.cmd', '.bat', '.ps1')) {
+                } elseif (@('.exe', '.dll', '.cmd', '.bat', '.ps1') -contains $o.Extension) {
                     $untrackedBins += $o.Name
                 }
             }
@@ -282,6 +318,7 @@ try {
             }
         } catch {
             Add-Check -Name 'manifest.json 解析' -Status WARN -Detail $_.Exception.Message
+        }
         }
     } else {
         Add-Check -Name 'manifest.json 缺失' -Status WARN -Detail '无法核对构建来源，建议重新运行 build_package.ps1'
@@ -350,14 +387,14 @@ try {
                 $nameRules = @($allRules | Where-Object { $_.DisplayName -like '*gnirehtet*' -or $_.Name -like '*gnirehtet*' })
 
                 $portFilters = @(Get-NetFirewallPortFilter -ErrorAction Stop)
-                $idsFor31416 = New-Object System.Collections.Generic.HashSet[string]
+                $idsFor31416 = @{}
                 foreach ($pf in $portFilters) {
                     foreach ($p in @($pf.LocalPort)) {
-                        if ([string]$p -eq '31416') { [void]$idsFor31416.Add($pf.InstanceID) }
+                        if ([string]$p -eq '31416') { $idsFor31416[$pf.InstanceID] = $true }
                     }
                 }
                 if ($idsFor31416.Count -gt 0) {
-                    $portRules = @($allRules | Where-Object { $idsFor31416.Contains($_.InstanceID) })
+                    $portRules = @($allRules | Where-Object { $idsFor31416.ContainsKey($_.InstanceID) })
                 }
             } else {
                 # Windows 7 兜底：使用 COM HNetCfg.FwPolicy2 只读枚举防火墙规则
@@ -366,7 +403,7 @@ try {
                 $pList = New-Object System.Collections.Generic.List[object]
                 foreach ($r in $fwPolicy.Rules) {
                     $allCount++
-                    $obj = [pscustomobject]@{
+                    $obj = New-Object PSObject -Property @{
                         DisplayName = [string]$r.Name
                         Enabled     = [bool]$r.Enabled
                         Direction   = if ($r.Direction -eq 1) { 'Inbound' } else { 'Outbound' }
@@ -409,22 +446,33 @@ try {
     Add-Section '6. 脚本语法检查'
     $psFiles = @()
     if (Test-Path -LiteralPath $ScriptsDir) {
-        $psFiles += @(Get-ChildItem -LiteralPath $ScriptsDir -Filter '*.ps1' -File -Recurse -ErrorAction SilentlyContinue)
+        $psFiles += @(Get-ChildItem -LiteralPath $ScriptsDir -Filter '*.ps1' -Recurse -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer })
     }
     if ($psFiles.Count -eq 0) {
         Add-Check -Name '脚本语法' -Status WARN -Detail 'scripts\ 下没有 .ps1 文件'
     } else {
+        $parserType = 'System.Management.Automation.Language.Parser' -as [type]
         foreach ($f in $psFiles) {
             $tokens = $null
             $errors = $null
-            [void][System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$tokens, [ref]$errors)
-            if ($errors -and $errors.Count -gt 0) {
-                Add-Check -Name "语法错误：$($f.Name)" -Status FAIL -Detail "$($errors.Count) 处" -Blocking
-                foreach ($e in $errors) {
-                    Add-Line ('       L{0}: {1}' -f $e.Extent.StartLineNumber, $e.Message)
+            if ($parserType) {
+                [void]$parserType::ParseFile($f.FullName, [ref]$tokens, [ref]$errors)
+                if ($errors -and $errors.Count -gt 0) {
+                    Add-Check -Name "语法错误：$($f.Name)" -Status FAIL -Detail "$($errors.Count) 处" -Blocking
+                    foreach ($e in $errors) {
+                        Add-Line ('       L{0}: {1}' -f $e.Extent.StartLineNumber, $e.Message)
+                    }
+                } else {
+                    Add-Check -Name "语法 $($f.Name)" -Status PASS -Detail "解析通过（$($tokens.Count) 个 token）"
                 }
             } else {
-                Add-Check -Name "语法 $($f.Name)" -Status PASS -Detail "解析通过（$($tokens.Count) 个 token）"
+                $src = [System.IO.File]::ReadAllText($f.FullName, [System.Text.Encoding]::UTF8)
+                $tokens = [System.Management.Automation.PSParser]::Tokenize($src, [ref]$errors)
+                if ($errors -and $errors.Count -gt 0) {
+                    Add-Check -Name "语法错误：$($f.Name)" -Status FAIL -Detail "$($errors.Count) 处" -Blocking
+                } else {
+                    Add-Check -Name "语法 $($f.Name)" -Status PASS -Detail "PS2.0 解析通过（$($tokens.Count) 个 token）"
+                }
             }
         }
     }
@@ -437,7 +485,7 @@ try {
             if (-not $script:EnvLibLoaded) { . $EnvLibPath }
             $envPre = Invoke-EnvPreflight -Root $Root
             foreach ($sev in @('BLOCKER', 'WARN', 'INFO')) {
-                foreach ($f in $envPre.Findings | Where-Object Severity -eq $sev) {
+                foreach ($f in $envPre.Findings | Where-Object { $_.Severity -eq $sev }) {
                     foreach ($l in (Format-EnvFinding -Finding $f)) { Add-Line $l }
                 }
             }
@@ -460,9 +508,9 @@ try {
 
     # ------------------------------------------------------------ 汇总
     Add-Section '8. 汇总'
-    $pass = @($script:Checks | Where-Object Status -eq 'PASS').Count
-    $warn = @($script:Checks | Where-Object Status -eq 'WARN').Count
-    $fail = @($script:Checks | Where-Object Status -eq 'FAIL').Count
+    $pass = @($script:Checks | Where-Object { $_.Status -eq 'PASS' }).Count
+    $warn = @($script:Checks | Where-Object { $_.Status -eq 'WARN' }).Count
+    $fail = @($script:Checks | Where-Object { $_.Status -eq 'FAIL' }).Count
     $blocking = @($script:Checks | Where-Object { $_.Status -eq 'FAIL' -and $_.Blocking }).Count
     $envBlockers = if ($envPre) { $envPre.Blockers } else { 0 }
     $envWarns = if ($envPre) { $envPre.Warnings } else { 0 }

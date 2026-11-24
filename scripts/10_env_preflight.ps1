@@ -46,9 +46,9 @@ param(
 
 $ErrorActionPreference = 'Continue'
 
-# 绿色版：不带参数时以包自身位置为准，整个目录可以随意搬动
-if (-not $Root) { $Root = Split-Path -Parent $PSScriptRoot }
-$here = Split-Path -Parent $PSCommandPath
+# 绿色版：兼容 PowerShell 2.0 ~ 7.x，不带参数时以包自身位置为准
+$here = Split-Path -Parent $MyInvocation.MyCommand.Path
+if (-not $Root) { $Root = Split-Path -Parent $here }
 . (Join-Path $here 'lib\EnvCheck.ps1')
 . (Join-Path $here 'lib\EnvFix.ps1')
 
@@ -68,7 +68,7 @@ function Add-Out {
 function Write-Result {
     param($Result)
     foreach ($sev in @('BLOCKER', 'WARN', 'INFO')) {
-        foreach ($f in $Result.Findings | Where-Object Severity -eq $sev) {
+        foreach ($f in $Result.Findings | Where-Object { $_.Severity -eq $sev }) {
             foreach ($l in (Format-EnvFinding -Finding $f)) { Add-Out $l }
         }
     }
@@ -100,13 +100,13 @@ function Read-Answer {
     if ($script:answerQueue.Count -gt 0) {
         $preset = $script:answerQueue.Dequeue()
         Add-Out ('（预置回答：' + $preset + '）')
-        if ($preset.Trim() -in $Allowed) { return $preset.Trim() }
+        if ($Allowed -contains $preset.Trim()) { return $preset.Trim() }
         return $null
     }
     try { $raw = Read-Host $Prompt } catch { return $null }
     if ($null -eq $raw) { return $null }
     $t = $raw.Trim()
-    if ($t -in $Allowed) { return $t }
+    if ($Allowed -contains $t) { return $t }
     return $null
 }
 
@@ -200,7 +200,7 @@ try {
         }
 
         if ($Apply -and (Test-Path -LiteralPath $p.DownloadDir)) {
-            $parts = @(Get-ChildItem -LiteralPath $p.DownloadDir -Filter '*.part' -File -ErrorAction SilentlyContinue)
+            $parts = @(Get-ChildItem -LiteralPath $p.DownloadDir -Filter '*.part' -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer })
             foreach ($f in $parts) {
                 if ($DryRun) {
                     Add-Out ('[演练] 本来会删除下载临时文件：' + $f.Name)
@@ -240,7 +240,7 @@ try {
         }
 
         if (Test-Path -LiteralPath $p.DownloadDir) {
-            $parts = @(Get-ChildItem -LiteralPath $p.DownloadDir -Filter '*.part' -File -ErrorAction SilentlyContinue)
+            $parts = @(Get-ChildItem -LiteralPath $p.DownloadDir -Filter '*.part' -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer })
             foreach ($f in $parts) {
                 Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
                 Add-Out ('[执行] 删除下载临时文件：' + $f.Name)
@@ -249,7 +249,7 @@ try {
         }
 
         $untouched = @($before.Findings | Where-Object {
-                $_.Severity -in @('BLOCKER', 'WARN') -and $_.Id -notin @('adb-server-own')
+                (@('BLOCKER', 'WARN') -contains $_.Severity) -and ($_.Id -ne 'adb-server-own')
             })
         if ($untouched.Count -gt 0) {
             Add-Out ''

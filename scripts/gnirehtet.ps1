@@ -1,124 +1,72 @@
 ﻿<#
 .SYNOPSIS
-    gnirehtet 统一入口：先过环境闸门，再只在该问的地方问你。
+    gnirehtet 唯一统一入口（兼容 Windows 7 原厂 PowerShell 2.0 ~ PowerShell 7.x）。
 
 .DESCRIPTION
-    设计原则：能自动判断的都不问。
-      · 只连一台手机      → 直接用，不打扰
-      · 连了多台手机      → 列出来让你选编号
-      · 只读操作（status）→ 直接执行，不确认
-      · 要动手机的操作（install / run / stop）→ 给一句话摘要，回车继续
-      · 自动化场景        → 加 -Yes（不再问）+ -Serial（多台时指定）
-
-    所有实机操作都走这里，避免裸跑 gnirehtet.exe 时用错 adb 或与别的服务冲突。
-    执行时把本包目录临时放到进程 PATH 最前面，只影响本次调用。
+    普通用户只需双击根目录 gnirehtet.bat，默认进入全自动一键模式（-Action auto）：
+      1. 自动检测本包 adb 能否运行，缺失运行库时自动静默安装内置 VC++ / UCRT 运行库
+      2. 自动清理本包残留进程；遇到端口冲突时提供一键隔离端口或关闭选项
+      3. 自动识别手机；Windows 7 缺少 USB 驱动或发现未知 Android 设备时自动安装内置驱动
+      4. 手机未授权时自动等待你在手机上点「允许」，点完自动继续
+      5. 自动安装手机客户端、尝试加省电白名单、启动反向网络；按 Ctrl+C 退出时自动收尾
 
 .PARAMETER Action
-    preflight（默认）| status | install | run | stop
+    auto（默认，全自动一键启动）| run | status | install | stop | install-deps | preflight | verify
 
 .PARAMETER Root
-    包根目录，默认取脚本所在包的根目录（整包可移动，无需指定）。
+    包根目录，默认按脚本自身位置定位（整包绿色可移动）。
 
 .PARAMETER Serial
-    设备序列号；有多台设备时用它指定，避免被问。
+    多台手机时可指定设备序列号。
 
 .PARAMETER Yes
-    跳过确认（install / run / stop），用于脚本或无人值守。
+    非交互模式（自动选默认项、不暂停）。
 
 .PARAMETER Force
-    环境体检有阻断项时仍然继续（确认可以打断对方服务时使用）。
+    忽略环境阻断项强制继续。
 
-.EXAMPLE
-    pwsh -NoProfile -File scripts\gnirehtet.ps1
-    pwsh -NoProfile -File scripts\gnirehtet.ps1 -Action status
-
-.NOTES
-    退出码：0 = 成功；3 = 闸门拒绝或环境未就绪；2 = 找不到可执行文件；其它为工具自身退出码。
+.PARAMETER PauseOnExit
+    结束前暂停按键（双击 gnirehtet.bat 时自动开启，防止窗口闪退）。
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('preflight', 'status', 'install', 'run', 'stop')]
-    [string]$Action = 'preflight',
+    [ValidateSet('auto', 'run', 'status', 'install', 'stop', 'install-deps', 'preflight', 'verify')]
+    [string]$Action = 'auto',
     [string]$Root = '',
-    [string]$Serial,
+    [string]$Serial = '',
     [switch]$Yes,
-    [switch]$Force
+    [switch]$Force,
+    [switch]$PauseOnExit
 )
 
 $ErrorActionPreference = 'Stop'
 
-# 绿色版：不带参数时以包自身位置为准，整个目录可以随意搬动
-if (-not $Root) { $Root = Split-Path -Parent $PSScriptRoot }
-$here = Split-Path -Parent $PSCommandPath
-. (Join-Path $here 'lib\EnvCheck.ps1')
-. (Join-Path $here 'lib\AdbDevices.ps1')
+# 兼容 PowerShell 2.0 ~ 7.x 获取脚本目录与包根目录
+$script:EntryDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+if (-not $Root) { $Root = Split-Path -Parent $script:EntryDir }
+
+. (Join-Path $script:EntryDir 'lib\EnvCheck.ps1')
+. (Join-Path $script:EntryDir 'lib\EnvFix.ps1')
+. (Join-Path $script:EntryDir 'lib\AdbDevices.ps1')
+. (Join-Path $script:EntryDir 'lib\Win7Deps.ps1')
 
 $p = Get-GnirehtetPaths -Root $Root
 
-$missingTools = @($p.GnExe, $p.AdbExe, $p.GnApk | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) })
-if ($missingTools.Count -gt 0) {
-    foreach ($m in $missingTools) {
-        Write-Host "[阻断] 找不到 $m" -ForegroundColor Red
+function Wait-ExitPause {
+    if ($PauseOnExit -and -not $Yes) {
+        Write-Host ''
+        try { Read-Host '按回车键关闭窗口' | Out-Null } catch { }
     }
-    Write-Host '       → 先运行 scripts\build_package.ps1' -ForegroundColor Yellow
-    exit 2
 }
 
-Write-Host ''
-Write-Host '── 环境体检 ──────────────────────────────────────────'
-$pre = Invoke-EnvPreflight -Root $Root
-
-foreach ($f in $pre.Findings | Where-Object { $_.Severity -in @('BLOCKER', 'WARN') } | Sort-Object { $script:SeverityRank[$_.Severity] }) {
-    foreach ($l in (Format-EnvFinding -Finding $f)) { Write-Host $l }
-}
-if ($pre.Blockers -eq 0 -and $pre.Warnings -eq 0) {
-    Write-Host '[通过] 未发现干扰风险。'
-}
-Write-Host ''
-Write-Host ('阻断 {0} 项 / 注意 {1} 项' -f $pre.Blockers, $pre.Warnings)
-Write-Host ''
-
-if ($Action -eq 'preflight') {
-    if ($pre.Blockers -gt 0) {
-        Write-Host '结论：暂不放行。'
-        Write-Host '  想处理干扰：pwsh -NoProfile -File scripts\10_env_preflight.ps1 -Fix'
-        Write-Host '  确认可以打断对方：在本命令后加 -Force'
-    } else {
-        Write-Host '结论：可以放行。下一步：'
-        Write-Host '  1) -Action status   看看手机认到没有'
-        Write-Host '  2) -Action install  装客户端（不会自动启动）'
-        Write-Host '  3) -Action run      开始反向上网'
-    }
-    exit $(if ($pre.Blockers -gt 0) { 3 } else { 0 })
-}
-
-if ($pre.Blockers -gt 0 -and -not $Force) {
-    Write-Host '拒绝执行：环境有阻断项，未指定 -Force。' -ForegroundColor Red
-    Write-Host '已停止，未连接设备、未启动任何进程。' -ForegroundColor Red
-    Write-Host ''
-    Write-Host '想先处理干扰，可以运行：' -ForegroundColor Yellow
-    Write-Host '  pwsh -NoProfile -File scripts\10_env_preflight.ps1 -Fix' -ForegroundColor Yellow
-    Write-Host '它会一个一个问你，说「关」才关。' -ForegroundColor Yellow
-    exit 3
-}
-if ($pre.Blockers -gt 0 -and $Force) {
-    Write-Host '[警告] 已用 -Force 跳过阻断项，可能打断其它服务。' -ForegroundColor Yellow
-    Write-Host ''
-}
-
-# 进程内临时置顶本包目录：只影响子进程，不改用户/系统 PATH
-$env:PATH = "$($p.ToolsDir);$env:PATH"
-
-# 先把 adb 服务用独立方式拉起来，避免第一次查询时 server 继承调用方的输出管道
-if ($Action -ne 'preflight') {
-    if (-not (Initialize-AdbServer -AdbExe $p.AdbExe)) {
-        Write-Host '[注意] adb 服务没能启动，后面可能连不上设备。' -ForegroundColor Yellow
-    }
+function Exit-Clean {
+    param([int]$Code = 0)
+    Wait-ExitPause
+    exit $Code
 }
 
 function Invoke-Tool {
     param([string]$Exe, [string[]]$Arguments)
-    Write-Host ('执行：' + $Exe + ' ' + ($Arguments -join ' ')) -ForegroundColor Cyan
     Push-Location -LiteralPath $p.ToolsDir
     try {
         & $Exe @Arguments | Out-Host
@@ -130,16 +78,14 @@ function Invoke-Tool {
 
 function Show-Devices {
     param($Devices)
-
     if ($Devices.Count -eq 0) {
-        Write-Host '没找到手机。检查三件事：'
-        Write-Host '  1. 数据线插好了吗（有的线只能充电，不能传数据）'
-        Write-Host '  2. 手机上「设置 → 开发者选项 → USB 调试」打开了吗'
-        Write-Host '  3. 手机弹窗点「允许」了吗（勾选“始终允许”以后不用再点）'
+        Write-Host '暂未发现已连接的手机。请检查：' -ForegroundColor Yellow
+        Write-Host '  1. 数据线是否插牢（部分充电线不能传数据）'
+        Write-Host '  2. 手机是否已打开「设置 → 开发者选项 → USB 调试」'
+        Write-Host '  3. 手机弹出「允许 USB 调试」时是否点了「允许」'
         return
     }
-
-    Write-Host ("找到 {0} 台设备：" -f $Devices.Count)
+    Write-Host ("发现 {0} 台设备：" -f $Devices.Count)
     $i = 0
     foreach ($d in $Devices) {
         $i++
@@ -147,75 +93,300 @@ function Show-Devices {
     }
 }
 
-# 选设备：指定了 -Serial 就用它；只有一台直接用；多台才问
-function Resolve-Device {
-    $probe = Get-AdbDevices -AdbExe $p.AdbExe
-    if (-not $probe.Ok) {
-        Write-Host '[没连上 adb] 看看下面这行：' -ForegroundColor Red
-        foreach ($l in ($probe.Raw -split "`r?`n" | Where-Object { $_.Trim() })) {
-            Write-Host ('  ' + $l)
-        }
-        return $null
-    }
-
-    $all = @($probe.Devices)
-
-    if ($Serial) {
-        $hit = $all | Where-Object { $_.Serial -eq $Serial } | Select-Object -First 1
-        if (-not $hit) {
-            Write-Host ("没找到序列号 {0} 的设备。" -f $Serial) -ForegroundColor Yellow
-            Show-Devices -Devices $all
-            return $null
-        }
-        if ($hit.State -ne 'device') {
-            Write-Host ("{0} 现在不能用：{1}" -f (Get-DeviceLabel -Device $hit), (Get-DeviceStateText -State $hit.State)) -ForegroundColor Yellow
-            return $null
-        }
-        Write-Host ("用 {0}。" -f (Get-DeviceLabel -Device $hit))
-        return $hit
-    }
-
-    $usable = @($all | Where-Object State -eq 'device')
-
-    if ($usable.Count -eq 0) {
-        Show-Devices -Devices $all
-        if ($all.Count -gt 0) {
-            Write-Host ''
-            Write-Host '设备在，但还不能操作：先在手机上点「允许」，或者拔插一次数据线。'
-        }
-        return $null
-    }
-
-    if ($usable.Count -eq 1) {
-        Write-Host ("用 {0}。" -f (Get-DeviceLabel -Device $usable[0]))
-        return $usable[0]
-    }
-
-    if ($Yes) {
-        Write-Host '接了多台设备，自动模式（-Yes）下必须用 -Serial 指定是哪台。已停止。' -ForegroundColor Yellow
-        Show-Devices -Devices $all
-        return $null
-    }
-
-    Select-AdbDevice -Devices $all
-}
-
-# 动手机之前问一句；回车=继续，n=取消，其它输入也当继续（傻瓜化）
-function Confirm-Step {
-    param([string]$Question, [string]$Detail = '')
-
-    Write-Host ''
-    Write-Host $Question
-    if ($Detail) { Write-Host ('  ' + $Detail) }
-
-    if ($Yes) {
-        Write-Host '  （-Yes：已自动继续）' -ForegroundColor DarkGray
+function Ensure-AdbRuntimeReady {
+    if (Test-AdbRunnable -AdbExe $p.AdbExe) {
         return $true
     }
 
-    try { $answer = Read-Host '  按回车继续，输入 n 取消' } catch { return $false }
-    if ($null -eq $answer) { return $false }
-    return -not ($answer.Trim() -match '^(n|no|取消|算了)$')
+    Write-Host '[依赖] 检测到当前系统无法直接运行 adb.exe（常见于 Windows 7 缺少系统运行库）。' -ForegroundColor Yellow
+    $depsInfo = Get-BundledDepsInfo -Root $Root
+    if (-not $depsInfo.HasVcRedist) {
+        Write-Host '[阻断] 包内缺少 deps\vc_redist.x86.exe，无法自动修复运行库。' -ForegroundColor Red
+        return $false
+    }
+
+    Write-Host '  正在自动安装内置微软运行库（deps\vc_redist.x86.exe），请稍候……' -ForegroundColor Cyan
+    $res = Install-BundledDeps -Root $Root -InstallRuntime
+    if (Test-AdbRunnable -AdbExe $p.AdbExe) {
+        Write-Host '  [通过] 运行库安装完成，adb 已可正常运行。' -ForegroundColor Green
+        return $true
+    }
+
+    if ($res.RebootSuggested) {
+        Write-Host '[提示] 运行库已安装，但 Windows 7 需要重启电脑一次才能生效。请重启后再双击 gnirehtet.bat。' -ForegroundColor Yellow
+    } else {
+        Write-Host '[阻断] 安装运行库后 adb 仍无法运行。' -ForegroundColor Red
+        if ($res.Log) { Write-Host ('  详情：' + ($res.Log.Trim() -replace '\s+', ' ')) -ForegroundColor DarkGray }
+    }
+    return $false
+}
+
+function Resolve-EnvironmentAuto {
+    # 1. 自动清理本包残留的 gnirehtet 进程（静默处理，不打扰用户）
+    $targets = @(Get-InterferenceTargets -Root $Root)
+    foreach ($t in $targets) {
+        if ($t.Own -and ($t.Kind -eq 'process' -or ($t.Kind -eq 'port' -and $t.Port -eq 31416))) {
+            Write-Host ("[*] 检测到上次残留的 gnirehtet（PID {0}），正在自动清理……" -f $t.Pid) -ForegroundColor DarkGray
+            Stop-InterferenceTarget -Target $t -Root $Root | Out-Null
+        }
+    }
+
+    # 2. 重新体检
+    $pre = Invoke-EnvPreflight -Root $Root
+    if ($pre.Blockers -eq 0) {
+        return $true
+    }
+
+    if ($Force) {
+        Write-Host '[警告] 已使用 -Force 忽略环境阻断项。' -ForegroundColor Yellow
+        return $true
+    }
+
+    # 3. 分别处理 5037 与 31416 外部冲突
+    $adbPort = Get-AdbServerPort
+    $adbConflicts = @($pre.Findings | Where-Object {
+        $_.Severity -eq 'BLOCKER' -and (@('adb-server-foreign', 'adb-port-non-adb') -contains $_.Id)
+    })
+    if ($adbConflicts.Count -gt 0) {
+        Write-Host ''
+        Write-Host ("[冲突] 电脑上已有别的软件占用了 ADB 端口 {0}：" -f $adbPort) -ForegroundColor Yellow
+        foreach ($f in $adbConflicts) {
+            foreach ($l in (Format-EnvFinding -Finding $f)) { Write-Host ('  ' + $l) }
+        }
+        Write-Host ''
+        if ($Yes) {
+            $env:ANDROID_ADB_SERVER_PORT = '5099'
+            Write-Host '[*] 自动模式：已切换到隔离端口 5099，不影响其它软件。' -ForegroundColor Cyan
+        } else {
+            Write-Host '请选择处理方式：'
+            Write-Host '  [1] 自动换用隔离端口 5099 继续（推荐，不打断别的软件，直接回车即可）'
+            Write-Host '  [2] 关闭占用端口的程序并继续'
+            Write-Host '  [3] 取消退出'
+            $ans = ''
+            try { $ans = Read-Host '输入 1 / 2 / 3（默认 1）' } catch { $ans = '3' }
+            $ans = if ($null -eq $ans) { '3' } else { $ans.Trim() }
+            if ($ans -eq '' -or $ans -eq '1') {
+                $env:ANDROID_ADB_SERVER_PORT = '5099'
+                Write-Host '[*] 已切换到隔离端口 5099，不打断其它软件。' -ForegroundColor Cyan
+            } elseif ($ans -eq '2') {
+                $nowTargets = @(Get-InterferenceTargets -Root $Root | Where-Object { $_.Port -eq $adbPort })
+                foreach ($nt in $nowTargets) {
+                    $r = Stop-InterferenceTarget -Target $nt -Root $Root
+                    Write-Host ('  -> ' + $r.Message)
+                }
+            } else {
+                Write-Host '已取消。'
+                return $false
+            }
+        }
+    }
+
+    $relayConflicts = @(Get-InterferenceTargets -Root $Root | Where-Object { $_.Port -eq 31416 -and -not $_.Own })
+    if ($relayConflicts.Count -gt 0) {
+        Write-Host ''
+        Write-Host '[冲突] 31416 端口被其它程序占用，gnirehtet 无法启动：' -ForegroundColor Yellow
+        foreach ($rc in $relayConflicts) {
+            Write-Host ("  · {0}（PID {1}）" -f $rc.Name, $rc.Pid)
+        }
+        if ($Yes) {
+            Write-Host '[阻断] 自动模式下不强制结束未知外部程序，请手动关闭后重试。' -ForegroundColor Red
+            return $false
+        }
+        Write-Host '  [1] 关闭上述程序并继续'
+        Write-Host '  [2] 取消退出（直接回车）'
+        $ans = ''
+        try { $ans = Read-Host '输入 1 或 2（默认 2）' } catch { $ans = '2' }
+        if ($null -ne $ans -and $ans.Trim() -eq '1') {
+            foreach ($rc in $relayConflicts) {
+                $r = Stop-InterferenceTarget -Target $rc -Root $Root
+                Write-Host ('  -> ' + $r.Message)
+            }
+        } else {
+            Write-Host '已取消。'
+            return $false
+        }
+    }
+
+    $after = Invoke-EnvPreflight -Root $Root
+    if ($after.Blockers -gt 0) {
+        Write-Host '[阻断] 端口冲突仍未解除，已安全停止。' -ForegroundColor Red
+        return $false
+    }
+    return $true
+}
+
+function Try-WhitelistPowerSaving {
+    param([string]$DeviceSerial)
+    try {
+        Invoke-ProcessCapture -FilePath $p.AdbExe -Arguments @('-s', $DeviceSerial, 'shell', 'dumpsys', 'deviceidle', 'whitelist', '+com.genymobile.gnirehtet') -TimeoutSeconds 8 | Out-Null
+    } catch { }
+}
+
+function Wait-AndResolveDevice {
+    param([switch]$AllowInteractiveWait)
+
+    $driverInstalledThisRun = $false
+
+    while ($true) {
+        $probe = Get-AdbDevices -AdbExe $p.AdbExe
+        if (-not $probe.Ok) {
+            Write-Host '[错误] 无法与 adb 通信：' -ForegroundColor Red
+            foreach ($l in ($probe.Raw -split "`r?`n" | Where-Object { $_.Trim() })) {
+                Write-Host ('  ' + $l)
+            }
+            return $null
+        }
+
+        $all = @($probe.Devices)
+
+        if ($Serial) {
+            $hit = $all | Where-Object { $_.Serial -eq $Serial } | Select-Object -First 1
+            if ($hit -and $hit.State -eq 'device') {
+                Write-Host ("[*] 已选中设备：{0}" -f (Get-DeviceLabel -Device $hit)) -ForegroundColor Green
+                return $hit
+            }
+            if ($hit) {
+                Write-Host ("[*] 设备 {0} 当前状态：{1}" -f (Get-DeviceLabel -Device $hit), (Get-DeviceStateText -State $hit.State)) -ForegroundColor Yellow
+            } else {
+                Write-Host ("[*] 尚未发现序列号 {0} 的设备。" -f $Serial) -ForegroundColor Yellow
+                Show-Devices -Devices $all
+            }
+            if (-not $AllowInteractiveWait -or $Yes) { return $null }
+        } else {
+            $usable = @($all | Where-Object { $_.State -eq 'device' })
+            if ($usable.Count -eq 1) {
+                Write-Host ("[*] 已识别手机：{0}" -f (Get-DeviceLabel -Device $usable[0])) -ForegroundColor Green
+                return $usable[0]
+            }
+            if ($usable.Count -gt 1) {
+                if ($Yes) {
+                    Write-Host '[阻断] 同时连接了多台手机，自动模式下请用 -Serial 指定序列号。' -ForegroundColor Yellow
+                    Show-Devices -Devices $all
+                    return $null
+                }
+                return (Select-AdbDevice -Devices $all)
+            }
+
+            # 如果检测到未授权设备，自动轮询等待用户在手机上点「允许」
+            $unauth = @($all | Where-Object { $_.State -eq 'unauthorized' })
+            if ($unauth.Count -gt 0 -and $AllowInteractiveWait -and -not $Yes) {
+                Write-Host ''
+                Write-Host '[等待授权] 已检测到手机，请在手机屏幕上点击「允许 USB 调试」（建议勾选始终允许）……' -ForegroundColor Cyan
+                Write-Host '           点完后这里会自动继续，无需任何操作（按 Ctrl+C 可取消）。' -ForegroundColor DarkGray
+                for ($w = 0; $w -lt 45; $w++) {
+                    Start-Sleep -Seconds 2
+                    $reProbe = Get-AdbDevices -AdbExe $p.AdbExe
+                    if ($reProbe.Ok) {
+                        $reUsable = @($reProbe.Devices | Where-Object { $_.State -eq 'device' })
+                        if ($reUsable.Count -ge 1) {
+                            Write-Host '[通过] 手机已授权！' -ForegroundColor Green
+                            if ($reUsable.Count -eq 1) { return $reUsable[0] }
+                            return (Select-AdbDevice -Devices @($reProbe.Devices))
+                        }
+                    }
+                }
+                Write-Host '[超时] 仍未收到手机授权，请检查手机屏幕弹窗或拔插数据线。' -ForegroundColor Yellow
+            } else {
+                Show-Devices -Devices $all
+            }
+        }
+
+        if (-not $AllowInteractiveWait -or $Yes) {
+            return $null
+        }
+
+        # 没找到设备时：针对 Windows 7 或存在异常 USB/Android 设备，自动安装内置 USB 驱动
+        if (-not $driverInstalledThisRun) {
+            $isWin7 = Test-IsLegacyWindows
+            $brokenUsb = @(Get-BrokenAndroidUsbDevices)
+            $depsInfo = Get-BundledDepsInfo -Root $Root
+            if (($isWin7 -or $brokenUsb.Count -gt 0) -and ($depsInfo.HasGoogleInf -or $depsInfo.HasUniversal)) {
+                Write-Host ''
+                if ($brokenUsb.Count -gt 0) {
+                    Write-Host '[驱动] 检测到电脑中有缺少驱动的 USB/手机设备，正在自动安装内置 Android USB 驱动……' -ForegroundColor Cyan
+                } else {
+                    Write-Host '[驱动] 当前为 Windows 7 老系统且尚未识别手机，正在自动安装内置 Android USB 驱动……' -ForegroundColor Cyan
+                }
+                $drvRes = Install-BundledDeps -Root $Root -InstallDrivers
+                $driverInstalledThisRun = $true
+                if ($drvRes.Ok) {
+                    Write-Host '[通过] 内置 USB 驱动安装完成！请拔掉手机数据线再重新插上。' -ForegroundColor Green
+                } else {
+                    Write-Host '[提示] 自动安装驱动未完成（可能取消了管理员授权），你也可以右键以管理员身份运行 gnirehtet.bat。' -ForegroundColor Yellow
+                }
+            }
+        }
+
+        Write-Host ''
+        $retry = ''
+        try { $retry = Read-Host '请插好手机并打开 USB 调试后按回车重试（输入 q 退出）' } catch { return $null }
+        if ($null -eq $retry -or $retry.Trim() -match '^(q|quit|exit|n)$') {
+            return $null
+        }
+    }
+}
+
+# ==============================================================================
+# 主流程
+# ==============================================================================
+Write-Host ''
+Write-Host '============================================================' -ForegroundColor Cyan
+Write-Host '  gnirehtet 手机通过 USB 借电脑上网（一键统一入口）' -ForegroundColor Cyan
+Write-Host '============================================================' -ForegroundColor Cyan
+
+# 校验核心文件是否存在
+$missingTools = @($p.GnExe, $p.AdbExe, $p.GnApk | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) })
+if ($missingTools.Count -gt 0) {
+    foreach ($m in $missingTools) {
+        Write-Host ("[阻断] 找不到必需文件：{0}" -f $m) -ForegroundColor Red
+    }
+    Write-Host '请确认整包已完整解压，或运行 scripts\build_package.ps1 重建工具包。' -ForegroundColor Yellow
+    Exit-Clean 2
+}
+
+# 快捷子命令：install-deps / verify / preflight
+if ($Action -eq 'install-deps') {
+    Write-Host '[*] 正在安装全部内置依赖（微软 VC++ 运行库 + Android USB 驱动）……' -ForegroundColor Cyan
+    $r = Install-BundledDeps -Root $Root -InstallRuntime -InstallDrivers
+    if ($r.Ok) {
+        Write-Host '[通过] 内置依赖安装完成。' -ForegroundColor Green
+        if ($r.RebootSuggested) {
+            Write-Host '[提示] 系统建议重启一次以使运行库完全生效。' -ForegroundColor Yellow
+        }
+        Exit-Clean 0
+    }
+    Write-Host '[失败] 安装未完成，请以管理员身份重试。' -ForegroundColor Red
+    if ($r.Log) { Write-Host $r.Log -ForegroundColor DarkGray }
+    Exit-Clean 2
+}
+
+if ($Action -eq 'verify') {
+    & (Join-Path $script:EntryDir '00_offline_verify.ps1') -Root $Root
+    Exit-Clean $LASTEXITCODE
+}
+
+if ($Action -eq 'preflight') {
+    & (Join-Path $script:EntryDir '10_env_preflight.ps1') -Root $Root
+    Exit-Clean $LASTEXITCODE
+}
+
+# 1. 确保 Win7 运行库就绪（adb 能正常运行）
+if (-not (Ensure-AdbRuntimeReady)) {
+    Exit-Clean 3
+}
+
+# 2. 进程级置顶本包目录与 ADB 环境变量（双保险，绝不用错系统里的 adb）
+$env:PATH = "$($p.ToolsDir);$env:PATH"
+$env:ADB  = $p.AdbExe
+
+# 3. 自动处理环境与端口冲突
+if (-not (Resolve-EnvironmentAuto)) {
+    Exit-Clean 3
+}
+
+# 4. 独立拉起 adb server
+if (-not (Initialize-AdbServer -AdbExe $p.AdbExe)) {
+    Write-Host '[注意] adb 服务启动超时，将尝试直接继续。' -ForegroundColor Yellow
 }
 
 switch ($Action) {
@@ -223,65 +394,65 @@ switch ($Action) {
     'status' {
         $probe = Get-AdbDevices -AdbExe $p.AdbExe
         if (-not $probe.Ok) {
-            Write-Host '[没连上 adb] 看看下面这行：' -ForegroundColor Red
-            foreach ($l in ($probe.Raw -split "`r?`n" | Where-Object { $_.Trim() })) {
-                Write-Host ('  ' + $l)
-            }
-            exit 2
+            Write-Host '[错误] adb 执行失败：' -ForegroundColor Red
+            Write-Host $probe.Raw
+            Exit-Clean 2
         }
         Write-Host ''
         Show-Devices -Devices @($probe.Devices)
-        Write-Host ''
-        $usable = @($probe.Devices | Where-Object State -eq 'device')
-        if ($usable.Count -gt 0) {
-            Write-Host '下一步：-Action install（装客户端）或 -Action run（直接开始）'
-        }
-        exit 0
+        Exit-Clean 0
     }
 
     'install' {
-        $dev = Resolve-Device
-        if (-not $dev) { exit 3 }
-
-        $ok = Confirm-Step -Question ("要给「{0}」安装 gnirehtet 客户端吗？" -f (Get-DeviceLabel -Device $dev)) `
-            -Detail '装完不会自动启动，随时可以用 -Action stop 收尾。'
-        if (-not $ok) { Write-Host ''; Write-Host '已取消，什么都没做。'; exit 0 }
-
+        $dev = Wait-AndResolveDevice
+        if (-not $dev) { Exit-Clean 3 }
+        Write-Host ("[*] 正在给 {0} 安装客户端……" -f (Get-DeviceLabel -Device $dev)) -ForegroundColor Cyan
         $code = Invoke-Tool -Exe $p.GnExe -Arguments @('install', $dev.Serial)
-        Write-Host ''
         if ($code -eq 0) {
-            Write-Host '装好了。下一步：-Action run 开始反向上网。'
+            Write-Host '[通过] 客户端安装成功。' -ForegroundColor Green
         } else {
-            Write-Host ("安装没成功（退出码 {0}）。常见原因：手机没授权、存储权限被拒、Android 版本不兼容。" -f $code) -ForegroundColor Yellow
+            Write-Host ("[失败] 安装失败（退出码 {0}），请检查手机是否弹出「允许通过 USB 安装」。" -f $code) -ForegroundColor Yellow
         }
-        exit $code
-    }
-
-    'run' {
-        $dev = Resolve-Device
-        if (-not $dev) { exit 3 }
-
-        $ok = Confirm-Step -Question ("要给「{0}」开启反向网络吗？" -f (Get-DeviceLabel -Device $dev)) `
-            -Detail '手机没装客户端时会先自动装好，然后在手机上建一个本地 VPN，把流量转到这台电脑。结束按 Ctrl+C。'
-        if (-not $ok) { Write-Host ''; Write-Host '已取消，什么都没做。'; exit 0 }
-
-        $code = Invoke-Tool -Exe $p.GnExe -Arguments @('run', $dev.Serial)
-        Write-Host ''
-        Write-Host '已结束。想确认收尾干净：-Action status'
-        exit $code
+        Exit-Clean $code
     }
 
     'stop' {
-        $dev = Resolve-Device
-        if (-not $dev) { exit 3 }
-
-        $ok = Confirm-Step -Question ("要停掉「{0}」上的 gnirehtet 吗？" -f (Get-DeviceLabel -Device $dev)) `
-            -Detail '停掉后手机会恢复原来的上网方式。'
-        if (-not $ok) { Write-Host ''; Write-Host '已取消，什么都没做。'; exit 0 }
-
+        $dev = Wait-AndResolveDevice
+        if (-not $dev) { Exit-Clean 3 }
+        Write-Host ("[*] 正在停止 {0} 上的反向网络……" -f (Get-DeviceLabel -Device $dev)) -ForegroundColor Cyan
         $code = Invoke-Tool -Exe $p.GnExe -Arguments @('stop', $dev.Serial)
+        if ($code -eq 0) {
+            Write-Host '[通过] 已停止，手机已恢复原网络。' -ForegroundColor Green
+        }
+        Exit-Clean $code
+    }
+
+    default {
+        # auto / run：全自动一条龙
+        $dev = Wait-AndResolveDevice -AllowInteractiveWait:($Action -eq 'auto')
+        if (-not $dev) { Exit-Clean 3 }
+
+        # 自动尝试加入省电白名单（减少国产系统杀后台）
+        Try-WhitelistPowerSaving -DeviceSerial $dev.Serial
+
         Write-Host ''
-        if ($code -eq 0) { Write-Host '已经停了。' }
-        exit $code
+        Write-Host ("[*] 正在为「{0}」开启 USB 反向网络……" -f (Get-DeviceLabel -Device $dev)) -ForegroundColor Green
+        Write-Host '    · 首次运行会自动在手机上安装 gnirehtet 客户端并弹出「VPN 网络连接请求」，请点「确定」'
+        Write-Host '    · 保持本窗口不要关闭；用完按 Ctrl+C 即可自动停止并恢复手机网络'
+        Write-Host '    · 提示：若个别国内 App 报无网络，让手机连上任意 Wi-Fi（无需外网）即可，流量仍走 USB'
+        Write-Host ''
+
+        $code = 0
+        try {
+            $code = Invoke-Tool -Exe $p.GnExe -Arguments @('run', $dev.Serial)
+        } finally {
+            Write-Host ''
+            Write-Host '[*] 正在收尾：停止手机端反向网络……' -ForegroundColor DarkGray
+            try {
+                Invoke-ProcessCapture -FilePath $p.GnExe -Arguments @('stop', $dev.Serial) -TimeoutSeconds 8 | Out-Null
+                Write-Host '[完成] 已停止，手机已恢复原有网络。' -ForegroundColor Green
+            } catch { }
+        }
+        Exit-Clean $code
     }
 }

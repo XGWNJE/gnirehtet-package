@@ -1,28 +1,26 @@
 ﻿<#
 .SYNOPSIS
-    构建 gnirehtet 反向 USB 工具包（纯离线准备，不接触手机、不改路由、不改防火墙）。
+    构建 gnirehtet 反向 USB 工具包（全离线准备，内置 Windows 7 老环境运行库与 USB 驱动）。
 
 .DESCRIPTION
-    1. 下载 gnirehtet Rust win64 v2.5.1 与 platform-tools（已存在且完整时跳过）。
-    2. 解压到 download\.stage 暂存区。
-    3. 把 gnirehtet.exe / gnirehtet.apk 等复制到 tools\gnirehtet。
-    4. 把 adb.exe、AdbWinApi.dll、AdbWinUsbApi.dll 复制到同一个 tools\gnirehtet 目录。
-    5. 生成 manifest.json（版本、文件大小、SHA256）供验收核对。
-    6. 清理暂存区。
-
-    ！本脚本不会执行 adb、不会启动 gnirehtet、不会修改系统网络配置。
+    1. 下载/校验：
+       - gnirehtet Rust win64 v2.5.1
+       - Android platform-tools r33.0.3（官方签名，零 Win8+ API 依赖，兼容 Windows 7/10/11）
+       - Microsoft Visual C++ 2015-2022 Redistributable x86（自带 Win7 UCRT / KB2999226）
+       - Google USB Driver（latest_usb_driver_windows.zip）
+       - Universal ADB Driver（UniversalAdbDriverSetup.msi）
+    2. 合入 tools\gnirehtet\ 与 deps\ 目录。
+    3. 生成 manifest.json（版本、文件大小、SHA256）供验收核对。
+    4. 清理暂存区。
 
 .PARAMETER Root
-    包根目录，默认取脚本所在包的根目录（整包可移动，无需指定）。
+    包根目录，默认按脚本自身位置定位。
 
 .PARAMETER Force
-    忽略已下载的压缩包，强制重新下载。
+    忽略已下载的缓存，强制重新下载。
 
 .PARAMETER SkipDownload
-    跳过下载，直接用 download\ 下已有的压缩包（校验存在性）。
-
-.EXAMPLE
-    pwsh -NoProfile -File scripts\build_package.ps1
+    跳过下载，直接使用 download\ 中已有的缓存文件。
 #>
 [CmdletBinding()]
 param(
@@ -32,25 +30,40 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 
-# Windows 7 / 旧版 .NET 默认仅开启 TLS 1.0，强开 TLS 1.2（3072）避免连 GitHub/Google HTTPS 失败
+# Windows 7 / 旧版 .NET 默认仅开启 TLS 1.0，强开 TLS 1.2（3072）
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072 } catch { }
 
-# 绿色版：不带参数时以包自身位置为准，整个目录可以随意搬动
-if (-not $Root) { $Root = Split-Path -Parent $PSScriptRoot }
+$script:BuildDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+if (-not $Root) { $Root = Split-Path -Parent $script:BuildDir }
 
-$GnirehtetVersion   = '2.5.1'
-$GnirehtetUrl       = "https://github.com/Genymobile/gnirehtet/releases/download/v$GnirehtetVersion/gnirehtet-rust-win64-v$GnirehtetVersion.zip"
-$GnirehtetZipSha256 = '7f5b1063e7895182aa60def1437e50363c3758144088dcd079037bb7c3c46a1c'
-$PlatformToolsUrl   = 'https://dl.google.com/android/repository/platform-tools-latest-windows.zip'
+$GnirehtetVersion     = '2.5.1'
+$GnirehtetUrl         = "https://github.com/Genymobile/gnirehtet/releases/download/v$GnirehtetVersion/gnirehtet-rust-win64-v$GnirehtetVersion.zip"
+$GnirehtetZipSha256   = '7f5b1063e7895182aa60def1437e50363c3758144088dcd079037bb7c3c46a1c'
 
-$DownloadDir = Join-Path $Root 'download'
-$LogsDir     = Join-Path $Root 'logs'
-$ToolsDir    = Join-Path $Root 'tools\gnirehtet'
-$StageDir    = Join-Path $DownloadDir '.stage'
-$GnirehtetZip = Join-Path $DownloadDir "gnirehtet-rust-win64-v$GnirehtetVersion.zip"
-$PlatformZip  = Join-Path $DownloadDir 'platform-tools-latest-windows.zip'
-$ManifestPath = Join-Path $Root 'manifest.json'
+$PlatformToolsVersion = '33.0.3'
+$PlatformToolsUrl     = 'https://dl.google.com/android/repository/platform-tools_r33.0.3-windows.zip'
+$PlatformToolsSha256  = '1e59afd40a74c5c0eab0a9fad3f0faf8a674267106e0b19921be9f67081808c2'
+
+$VcRedistUrl          = 'https://aka.ms/vs/17/release/vc_redist.x86.exe'
+$GoogleUsbUrl         = 'https://dl.google.com/android/repository/latest_usb_driver_windows.zip'
+$UniversalAdbUrl      = 'https://github.com/koush/adb.clockworkmod.com/releases/latest/download/UniversalAdbDriverSetup.msi'
+$UniversalAdbSha256   = '4e77e303bba6cf84588bdb6da91f7a875d406f7930cbe9f4d2aae0b643c0c928'
+
+$DownloadDir    = Join-Path $Root 'download'
+$LogsDir        = Join-Path $Root 'logs'
+$ToolsDir       = Join-Path $Root 'tools\gnirehtet'
+$DepsDir        = Join-Path $Root 'deps'
+$GoogleDrvDest  = Join-Path $DepsDir 'google-usb-driver'
+$StageDir       = Join-Path $DownloadDir '.stage'
+
+$GnirehtetZip   = Join-Path $DownloadDir "gnirehtet-rust-win64-v$GnirehtetVersion.zip"
+$PlatformZip    = Join-Path $DownloadDir "platform-tools_r$PlatformToolsVersion-windows.zip"
+$VcRedistSrc    = Join-Path $DownloadDir 'vc_redist.x86.exe'
+$GoogleUsbZip   = Join-Path $DownloadDir 'latest_usb_driver_windows.zip'
+$UniversalMsi   = Join-Path $DownloadDir 'UniversalAdbDriverSetup.msi'
+$ManifestPath   = Join-Path $Root 'manifest.json'
 
 function Write-Info { param([string]$m) Write-Host "[*] $m" }
 function Write-Ok   { param([string]$m) Write-Host "[+] $m" -ForegroundColor Green }
@@ -87,14 +100,14 @@ function Get-Sha256 {
     }
 }
 
-function Assert-GoogleSignature {
-    param([string]$Path)
+function Assert-AuthenticodeSigner {
+    param([string]$Path, [string]$SubjectPattern, [string]$Label)
     $sig = Get-AuthenticodeSignature -LiteralPath $Path
-    if ($sig.Status -ne 'Valid' -or -not $sig.SignerCertificate -or ($sig.SignerCertificate.Subject -notmatch 'CN=Google LLC')) {
+    if ($sig.Status -ne 'Valid' -or -not $sig.SignerCertificate -or ($sig.SignerCertificate.Subject -notmatch $SubjectPattern)) {
         $subject = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { '无签名' }
         Fail "数字签名校验失败：$(Split-Path -Leaf $Path)（状态=$($sig.Status)，签发者=$subject）"
     }
-    Write-Ok "数字签名通过（Google LLC）：$(Split-Path -Leaf $Path)"
+    Write-Ok "数字签名通过（$Label）：$(Split-Path -Leaf $Path)"
 }
 
 function Get-RemoteFile {
@@ -140,7 +153,6 @@ function Get-RemoteFile {
         & curl.exe -fL --retry 3 --retry-delay 2 --connect-timeout 30 --max-time 900 -o $tmp $Url
         if ($LASTEXITCODE -ne 0) { Fail "下载失败（curl 退出码 $LASTEXITCODE）：$Url" }
     } else {
-        # Windows 7 默认没有 curl.exe，回退到 .NET WebClient（已开启 TLS 1.2）
         $wc = New-Object System.Net.WebClient
         try {
             $wc.DownloadFile($Url, $tmp)
@@ -193,18 +205,21 @@ function Expand-ToStage {
 
 # ---------------------------------------------------------------- 目录准备
 Write-Info "包根目录：$Root"
-New-Item -ItemType Directory -Force -Path $DownloadDir, $LogsDir, $ToolsDir | Out-Null
+New-Item -ItemType Directory -Force -Path $DownloadDir, $LogsDir, $ToolsDir, $DepsDir | Out-Null
 
 # ---------------------------------------------------------------- 下载
-Get-RemoteFile -Url $GnirehtetUrl     -OutFile $GnirehtetZip -MinBytes 100000 -ExpectedSha256 $GnirehtetZipSha256
-Get-RemoteFile -Url $PlatformToolsUrl -OutFile $PlatformZip  -MinBytes 1000000
+Get-RemoteFile -Url $GnirehtetUrl    -OutFile $GnirehtetZip -MinBytes 100000   -ExpectedSha256 $GnirehtetZipSha256
+Get-RemoteFile -Url $PlatformToolsUrl -OutFile $PlatformZip -MinBytes 1000000  -ExpectedSha256 $PlatformToolsSha256
+Get-RemoteFile -Url $VcRedistUrl     -OutFile $VcRedistSrc  -MinBytes 5000000
+Get-RemoteFile -Url $GoogleUsbUrl    -OutFile $GoogleUsbZip -MinBytes 1000000
+Get-RemoteFile -Url $UniversalAdbUrl -OutFile $UniversalMsi -MinBytes 1000000  -ExpectedSha256 $UniversalAdbSha256
 
 # ---------------------------------------------------------------- gnirehtet
 $gStage = Join-Path $StageDir 'gnirehtet'
 Expand-ToStage -Zip $GnirehtetZip -Dest $gStage
 
-$gnExe = Get-ChildItem -LiteralPath $gStage -Recurse -File -Filter 'gnirehtet.exe' |
-    Select-Object -First 1
+$gnExe = Get-ChildItem -LiteralPath $gStage -Recurse -Filter 'gnirehtet.exe' |
+    Where-Object { -not $_.PSIsContainer } | Select-Object -First 1
 if (-not $gnExe) { Fail 'gnirehtet 压缩包内未找到 gnirehtet.exe' }
 
 Write-Info "合入 gnirehtet 文件：$($gnExe.DirectoryName)"
@@ -212,82 +227,135 @@ Get-ChildItem -LiteralPath $gnExe.DirectoryName | ForEach-Object {
     Copy-Item -LiteralPath $_.FullName -Destination $ToolsDir -Recurse -Force
 }
 
-# ---------------------------------------------------------------- platform-tools
+# ---------------------------------------------------------------- platform-tools (r33.0.3 Win7/10/11 全兼容)
 $pStage = Join-Path $StageDir 'platform-tools'
 Expand-ToStage -Zip $PlatformZip -Dest $pStage
 
-$adbExe = Get-ChildItem -LiteralPath $pStage -Recurse -File -Filter 'adb.exe' |
-    Select-Object -First 1
+$adbExe = Get-ChildItem -LiteralPath $pStage -Recurse -Filter 'adb.exe' |
+    Where-Object { -not $_.PSIsContainer } | Select-Object -First 1
 if (-not $adbExe) { Fail 'platform-tools 压缩包内未找到 adb.exe' }
 
 $adbDir = $adbExe.DirectoryName
-Write-Info "合入 adb 三件套：$adbDir"
+Write-Info "合入 Win7/10/11 兼容 adb 三件套（r$PlatformToolsVersion）：$adbDir"
 foreach ($name in @('adb.exe', 'AdbWinApi.dll', 'AdbWinUsbApi.dll')) {
     $src = Join-Path $adbDir $name
     if (-not (Test-Path -LiteralPath $src)) { Fail "platform-tools 内缺少 $name" }
-    Assert-GoogleSignature -Path $src
     Copy-Item -LiteralPath $src -Destination $ToolsDir -Force
     Write-Ok "复制 $name"
 }
 
+# ---------------------------------------------------------------- Win7 离线依赖 deps\
+Write-Info '合入 Windows 7 老环境离线依赖（运行库 + USB 驱动）'
+Assert-AuthenticodeSigner -Path $VcRedistSrc -SubjectPattern 'CN=Microsoft Corporation' -Label 'Microsoft'
+Copy-Item -LiteralPath $VcRedistSrc  -Destination (Join-Path $DepsDir 'vc_redist.x86.exe') -Force
+Write-Ok '复制 deps\vc_redist.x86.exe'
+
+Copy-Item -LiteralPath $UniversalMsi -Destination (Join-Path $DepsDir 'UniversalAdbDriverSetup.msi') -Force
+Write-Ok '复制 deps\UniversalAdbDriverSetup.msi'
+
+$uStage = Join-Path $StageDir 'google-usb'
+Expand-ToStage -Zip $GoogleUsbZip -Dest $uStage
+$infFile = Get-ChildItem -LiteralPath $uStage -Recurse -Filter 'android_winusb.inf' |
+    Where-Object { -not $_.PSIsContainer } | Select-Object -First 1
+if (-not $infFile) { Fail 'Google USB 驱动包内未找到 android_winusb.inf' }
+if (Test-Path -LiteralPath $GoogleDrvDest) { Remove-Item -LiteralPath $GoogleDrvDest -Recurse -Force }
+Copy-Item -LiteralPath $infFile.DirectoryName -Destination $GoogleDrvDest -Recurse -Force
+Write-Ok '展开 deps\google-usb-driver\'
+
 # ---------------------------------------------------------------- 校验落地文件
 $required = @(
-    @{ Name = 'gnirehtet.exe';   Min = 1000 },
-    @{ Name = 'gnirehtet.apk';   Min = 10000 },
-    @{ Name = 'adb.exe';         Min = 1000 },
-    @{ Name = 'AdbWinApi.dll';   Min = 1000 },
-    @{ Name = 'AdbWinUsbApi.dll'; Min = 1000 }
+    @{ Path = (Join-Path $ToolsDir 'gnirehtet.exe');   Min = 1000 },
+    @{ Path = (Join-Path $ToolsDir 'gnirehtet.apk');   Min = 10000 },
+    @{ Path = (Join-Path $ToolsDir 'adb.exe');         Min = 1000 },
+    @{ Path = (Join-Path $ToolsDir 'AdbWinApi.dll');   Min = 1000 },
+    @{ Path = (Join-Path $ToolsDir 'AdbWinUsbApi.dll'); Min = 1000 },
+    @{ Path = (Join-Path $DepsDir  'vc_redist.x86.exe'); Min = 5000000 },
+    @{ Path = (Join-Path $DepsDir  'UniversalAdbDriverSetup.msi'); Min = 1000000 },
+    @{ Path = (Join-Path $GoogleDrvDest 'android_winusb.inf'); Min = 1000 }
 )
 
-Write-Info '校验 tools\gnirehtet 落地文件'
+Write-Info '校验工具与依赖落地文件'
 foreach ($r in $required) {
-    $p = Join-Path $ToolsDir $r.Name
-    if (-not (Test-Path -LiteralPath $p)) { Fail "落地文件缺失：$p" }
-    $len = (Get-Item -LiteralPath $p).Length
-    if ($len -lt $r.Min) { Fail "落地文件过小（$len 字节）：$p" }
-    Write-Ok ('{0,-18} {1,10} 字节' -f $r.Name, $len)
-}
-
-# 额外附带文件仅做提示，不作硬性要求
-$extras = Get-ChildItem -LiteralPath $ToolsDir -File |
-    Where-Object { $required.Name -notcontains $_.Name }
-if ($extras) {
-    Write-Note ('同目录附带文件：' + (($extras | Select-Object -ExpandProperty Name) -join ', '))
+    if (-not (Test-Path -LiteralPath $r.Path)) { Fail "落地文件缺失：$($r.Path)" }
+    $len = (Get-Item -LiteralPath $r.Path).Length
+    if ($len -lt $r.Min) { Fail "落地文件过小（$len 字节）：$($r.Path)" }
+    Write-Ok ('{0,-32} {1,10} 字节' -f (Split-Path -Leaf $r.Path), $len)
 }
 
 # ---------------------------------------------------------------- manifest
-$manifest = [ordered]@{
-    createdAt        = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz')
-    os               = Get-OsDescription
-    gnirehtetVersion = $GnirehtetVersion
-    archives         = @(
-        [ordered]@{
+$toolFiles = @(Get-ChildItem -LiteralPath $ToolsDir | Where-Object { -not $_.PSIsContainer } | Sort-Object Name)
+$depFiles  = @(
+    (Join-Path $DepsDir 'vc_redist.x86.exe'),
+    (Join-Path $DepsDir 'UniversalAdbDriverSetup.msi'),
+    (Join-Path $GoogleDrvDest 'android_winusb.inf')
+)
+
+$manifest = @{
+    createdAt            = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz')
+    os                   = Get-OsDescription
+    gnirehtetVersion     = $GnirehtetVersion
+    platformToolsVersion = $PlatformToolsVersion
+    archives             = @(
+        @{
             file   = Split-Path -Leaf $GnirehtetZip
             url    = $GnirehtetUrl
             bytes  = (Get-Item -LiteralPath $GnirehtetZip).Length
             sha256 = Get-Sha256 -Path $GnirehtetZip
         },
-        [ordered]@{
+        @{
             file   = Split-Path -Leaf $PlatformZip
             url    = $PlatformToolsUrl
             bytes  = (Get-Item -LiteralPath $PlatformZip).Length
             sha256 = Get-Sha256 -Path $PlatformZip
+        },
+        @{
+            file   = Split-Path -Leaf $VcRedistSrc
+            url    = $VcRedistUrl
+            bytes  = (Get-Item -LiteralPath $VcRedistSrc).Length
+            sha256 = Get-Sha256 -Path $VcRedistSrc
+        },
+        @{
+            file   = Split-Path -Leaf $GoogleUsbZip
+            url    = $GoogleUsbUrl
+            bytes  = (Get-Item -LiteralPath $GoogleUsbZip).Length
+            sha256 = Get-Sha256 -Path $GoogleUsbZip
+        },
+        @{
+            file   = Split-Path -Leaf $UniversalMsi
+            url    = $UniversalAdbUrl
+            bytes  = (Get-Item -LiteralPath $UniversalMsi).Length
+            sha256 = Get-Sha256 -Path $UniversalMsi
         }
     )
     tools = @(
-        Get-ChildItem -LiteralPath $ToolsDir -File | Sort-Object Name | ForEach-Object {
-            [ordered]@{
-                file   = $_.Name
-                bytes  = $_.Length
-                sha256 = Get-Sha256 -Path $_.FullName
+        foreach ($tf in $toolFiles) {
+            @{
+                file   = $tf.Name
+                bytes  = $tf.Length
+                sha256 = Get-Sha256 -Path $tf.FullName
+            }
+        }
+    )
+    deps = @(
+        foreach ($dp in $depFiles) {
+            $item = Get-Item -LiteralPath $dp
+            $rel  = $dp.Substring($DepsDir.Length).TrimStart('\', '/')
+            @{
+                file   = $rel -replace '\\', '/'
+                bytes  = $item.Length
+                sha256 = Get-Sha256 -Path $dp
             }
         }
     )
 }
 
-$jsonText = $manifest | ConvertTo-Json -Depth 6
-[System.IO.File]::WriteAllText($ManifestPath, $jsonText, (New-Object System.Text.UTF8Encoding($false)))
-Write-Ok "已生成清单：$ManifestPath"
+if (Get-Command ConvertTo-Json -ErrorAction SilentlyContinue) {
+    $jsonText = $manifest | ConvertTo-Json -Depth 6
+    [System.IO.File]::WriteAllText($ManifestPath, $jsonText, (New-Object System.Text.UTF8Encoding($false)))
+    Write-Ok "已生成清单：$ManifestPath"
+} else {
+    Write-Note '当前 PowerShell 版本不支持 ConvertTo-Json，已跳过 manifest.json 重写。'
+}
 
 # ---------------------------------------------------------------- 清理暂存
 if (Test-Path -LiteralPath $StageDir) {
@@ -296,8 +364,6 @@ if (Test-Path -LiteralPath $StageDir) {
 }
 
 Write-Host ''
-Write-Ok "构建完成：$ToolsDir"
-Write-Host ''
-Write-Host '提醒：构建只准备文件，不接触手机。实机前请先跑环境预检：' -ForegroundColor Yellow
-Write-Host '      pwsh -NoProfile -File scripts\10_env_preflight.ps1' -ForegroundColor Yellow
+Write-Ok "构建完成：$ToolsDir + $DepsDir"
+Write-Host '使用方式：直接双击根目录 gnirehtet.bat 即可全自动运行。' -ForegroundColor Yellow
 exit 0

@@ -1,14 +1,11 @@
 ﻿<#
-    设备识别库：读取 adb devices 列表、把状态翻译成人话、多设备时让人选。
-
-    只在“已经通过环境闸门、准备操作手机”时使用——因为 `adb devices`
-    会拉起 adb 服务，属于会改变运行状态的动作。
+    设备识别库：读取 adb devices 列表、把状态翻译成人话、多设备时让人选（兼容 PowerShell 2.0 ~ 7.x）。
 #>
 
 function Get-AdbDevices {
     param([string]$AdbExe)
 
-    $result = [pscustomobject]@{ Ok = $false; Devices = @(); Raw = '' }
+    $result = New-Object PSObject -Property @{ Ok = $false; Devices = @(); Raw = '' }
     if (-not $AdbExe -or -not (Test-Path -LiteralPath $AdbExe)) {
         $result.Raw = '找不到 adb.exe'
         return $result
@@ -25,18 +22,17 @@ function Get-AdbDevices {
 
     $list = New-Object System.Collections.Generic.List[object]
     foreach ($line in ($raw -split "`r?`n")) {
-        # 形如：a1b2c3d4  device product:.. model:Mi_13 device:..
         if ($line -match '^\s*([A-Za-z0-9._:\-]+)\s+(device|unauthorized|offline|bootloader|recovery|sideload)\b(.*)$') {
             $serial = $Matches[1]
             $state = $Matches[2]
             $rest = $Matches[3]
             $model = ''
             if ($rest -match 'model:(\S+)') { $model = ($Matches[1] -replace '_', ' ') }
-            $list.Add([pscustomobject]@{
+            $list.Add((New-Object PSObject -Property @{
                 Serial = $serial
                 State  = $state
                 Model  = $model
-            })
+            }))
         }
     }
     $result.Devices = $list.ToArray()
@@ -44,18 +40,6 @@ function Get-AdbDevices {
     $result
 }
 
-<#
-.SYNOPSIS
-    确保 adb 服务已经就绪，避免第一次查询时由 adb 客户端临时拉起常驻 server。
-
-.DESCRIPTION
-    adb 客户端拉起 server 时会把自己的句柄表复制给 server。如果调用方的标准输出
-    是管道（例如 | Tee-Object），那个写端会被 server 长期持有，导致管道永远等不到
-    结束——脚本早就跑完了，外层却一直挂着。
-
-    因此在任何查询之前，先用 ShellExecute 方式（不继承句柄）单独把 server 拉起来。
-    版本或来源不一致时，先停再起，保证用的是本包 adb。
-#>
 function Initialize-AdbServer {
     param([string]$AdbExe, [int]$TimeoutSeconds = 25)
 
@@ -77,7 +61,6 @@ function Initialize-AdbServer {
     $listening = @(Get-TcpPortConnections -Port $port -ListenOnly)
     if ($listening.Count -gt 0) {
         $owner = Get-CimProcess -ProcessId $listening[0].OwningProcess
-        # 安全防线：端口占用者不是 adb.exe 时，绝不调用其可执行文件，也不强行 kill-server
         if ($owner -and $owner.Name -ine 'adb.exe') {
             Write-Host ("  [阻断] 端口 {0} 被非 adb 程序占用：{1}（PID {2}），跳过重启。" -f $port, $owner.Name, $listening[0].OwningProcess) -ForegroundColor Yellow
             return $false
@@ -101,7 +84,7 @@ function Initialize-AdbServer {
         }
     }
 
-    # 关键：ShellExecute 启动，子进程不继承调用方的管道句柄
+    # ShellExecute 启动，子进程不继承调用方的管道句柄
     Start-Process -FilePath $AdbExe -ArgumentList 'start-server' -WindowStyle Hidden | Out-Null
 
     for ($i = 0; $i -lt ($TimeoutSeconds * 5); $i++) {
@@ -131,19 +114,13 @@ function Get-DeviceLabel {
     if ($Device.Model) { "$($Device.Model)（$($Device.Serial)）" } else { "未知型号（$($Device.Serial)）" }
 }
 
-<#
-.SYNOPSIS
-    从设备列表里选一台。只有一台时直接返回，不打扰。
-.PARAMETER Preset
-    预置回答，供自动化测试使用；正常交互时留空。
-#>
 function Select-AdbDevice {
     param(
         $Devices,
         [string]$Preset
     )
 
-    $usable = @($Devices | Where-Object State -eq 'device')
+    $usable = @($Devices | Where-Object { $_.State -eq 'device' })
     if ($usable.Count -eq 0) { return $null }
     if ($usable.Count -eq 1) { return $usable[0] }
 

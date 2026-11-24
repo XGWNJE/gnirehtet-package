@@ -1,21 +1,24 @@
 ﻿<#
-    共享环境检测库（只读）。
+    共享环境检测库（只读，兼容 PowerShell 2.0 ~ 7.x）。
 
     被以下脚本点引用：
       scripts\10_env_preflight.ps1   环境预检
       scripts\00_offline_verify.ps1  离线验收（汇总环境风险）
-      scripts\gnirehtet.ps1          统一入口（闸门）
+      scripts\gnirehtet.ps1          统一入口
 
     本库只查询进程、端口、环境变量和文件，不结束进程、不改配置。
 #>
 
 $script:SeverityRank = @{ 'BLOCKER' = 0; 'WARN' = 1; 'INFO' = 2 }
+$script:EnvCheckLibDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 function Resolve-PackageRoot {
     param([string]$Root)
     if ($Root) { return $Root }
-    # 默认取“正在运行的脚本”所在包的根目录，整包可以随意搬动
-    if ($PSCommandPath) { return (Split-Path -Parent (Split-Path -Parent $PSCommandPath)) }
+    # 默认取“本库所在包的根目录”，兼容 PowerShell 2.0 ~ 7.x，整包可任意搬动
+    if ($script:EnvCheckLibDir) {
+        return (Split-Path -Parent (Split-Path -Parent $script:EnvCheckLibDir))
+    }
     return (Get-Location).Path
 }
 
@@ -32,12 +35,13 @@ function Get-AdbServerPort {
 function Get-GnirehtetPaths {
     param([string]$Root = '')
     $Root = Resolve-PackageRoot -Root $Root
-    [pscustomobject]@{
+    New-Object PSObject -Property @{
         Root        = $Root
         ToolsDir    = Join-Path $Root 'tools\gnirehtet'
         AdbExe      = Join-Path $Root 'tools\gnirehtet\adb.exe'
         GnExe       = Join-Path $Root 'tools\gnirehtet\gnirehtet.exe'
         GnApk       = Join-Path $Root 'tools\gnirehtet\gnirehtet.apk'
+        DepsDir     = Join-Path $Root 'deps'
         LogsDir     = Join-Path $Root 'logs'
         DownloadDir = Join-Path $Root 'download'
     }
@@ -53,7 +57,7 @@ function New-Finding {
         [string[]]$Evidence = @(),
         [switch]$AutoFix
     )
-    [pscustomobject]@{
+    New-Object PSObject -Property @{
         Severity = $Severity
         Id       = $Id
         Title    = $Title
@@ -104,13 +108,13 @@ function Get-CimProcess {
                 if ($w.CreationDate) {
                     try { $cd = [Management.ManagementDateTimeConverter]::ToDateTime($w.CreationDate) } catch { $cd = $w.CreationDate }
                 }
-                return [pscustomobject]@{
+                return (New-Object PSObject -Property @{
                     ProcessId      = [int]$w.ProcessId
                     Name           = $w.Name
                     ExecutablePath = $w.ExecutablePath
                     CommandLine    = $w.CommandLine
                     CreationDate   = $cd
-                }
+                })
             }
         } catch { }
     }
@@ -119,13 +123,13 @@ function Get-CimProcess {
         $pPath = $null; $pStart = $null
         try { $pPath = $p.Path } catch { }
         try { $pStart = $p.StartTime } catch { }
-        return [pscustomobject]@{
+        return (New-Object PSObject -Property @{
             ProcessId      = [int]$p.Id
             Name           = if ($p.ProcessName -like '*.exe') { $p.ProcessName } else { "$($p.ProcessName).exe" }
             ExecutablePath = $pPath
             CommandLine    = $null
             CreationDate   = $pStart
-        }
+        })
     } catch {
         return $null
     }
@@ -139,7 +143,6 @@ function Get-TcpPortConnections {
         try {
             return @(Get-NetTCPConnection @query -ErrorAction Stop)
         } catch {
-            # 无匹配连接时 cmdlet 会抛 No MSFT_NetTCPConnection objects found；区分无连接与 CIM 不可用
             if ($_.Exception.Message -match 'No MSFT_NetTCPConnection|找不到任何') {
                 return @()
             }
@@ -167,14 +170,14 @@ function Get-TcpPortConnections {
                 default       { $rawState }
             }
             if ($ListenOnly -and $state -ne 'Listen') { continue }
-            $results.Add([pscustomobject]@{
+            $results.Add((New-Object PSObject -Property @{
                 LocalAddress  = $localAddr
                 LocalPort     = $localPort
                 RemoteAddress = $remoteAddr
                 RemotePort    = $remotePort
                 State         = $state
                 OwningProcess = $owningPid
-            })
+            }))
         }
     }
     return $results.ToArray()
@@ -185,7 +188,7 @@ function Get-PortOwners {
     $conns = @(Get-TcpPortConnections -Port $Port -ListenOnly:$ListenOnly)
     foreach ($c in $conns) {
         $proc = Get-CimProcess -ProcessId $c.OwningProcess
-        [pscustomobject]@{
+        New-Object PSObject -Property @{
             Port         = $Port
             Local        = "$($c.LocalAddress):$($c.LocalPort)"
             Remote       = "$($c.RemoteAddress):$($c.RemotePort)"
@@ -205,7 +208,7 @@ function Get-ProcessListByName {
         try {
             return @(Get-CimInstance Win32_Process -Filter "Name='$ExeName'" -ErrorAction Stop |
                 ForEach-Object {
-                    [pscustomobject]@{
+                    New-Object PSObject -Property @{
                         PID          = [int]$_.ProcessId
                         Path         = $_.ExecutablePath
                         CommandLine  = $_.CommandLine
@@ -222,7 +225,7 @@ function Get-ProcessListByName {
                     if ($_.CreationDate) {
                         try { $cd = [Management.ManagementDateTimeConverter]::ToDateTime($_.CreationDate) } catch { $cd = $_.CreationDate }
                     }
-                    [pscustomobject]@{
+                    New-Object PSObject -Property @{
                         PID          = [int]$_.ProcessId
                         Path         = $_.ExecutablePath
                         CommandLine  = $_.CommandLine
@@ -237,7 +240,7 @@ function Get-ProcessListByName {
             $pPath = $null; $pStart = $null
             try { $pPath = $_.Path } catch { }
             try { $pStart = $_.StartTime } catch { }
-            [pscustomobject]@{
+            New-Object PSObject -Property @{
                 PID          = [int]$_.Id
                 Path         = $pPath
                 CommandLine  = $null
@@ -254,6 +257,30 @@ function Get-GnirehtetProcessList {
     Get-ProcessListByName -ExeName 'gnirehtet.exe'
 }
 
+function Find-PathExecutables {
+    param([string]$FileName)
+    $hits = New-Object System.Collections.Generic.List[string]
+    $seen = @{}
+    if (-not $env:PATH) { return @() }
+    foreach ($dir in ($env:PATH -split ';')) {
+        $d = $dir.Trim().Trim('"')
+        if (-not $d) { continue }
+        $candidate = Join-Path $d $FileName
+        $exists = $false
+        try { $exists = Test-Path -LiteralPath $candidate -PathType Leaf -ErrorAction SilentlyContinue } catch { $exists = $false }
+        if ($exists) {
+            $full = $candidate
+            try { $full = [IO.Path]::GetFullPath($candidate) } catch { }
+            $key = $full.ToLowerInvariant()
+            if (-not $seen.ContainsKey($key)) {
+                $seen[$key] = $true
+                $hits.Add($full)
+            }
+        }
+    }
+    return $hits.ToArray()
+}
+
 function Invoke-ProcessCapture {
     param(
         [string]$FilePath,
@@ -263,21 +290,32 @@ function Invoke-ProcessCapture {
 
     $outFile = Join-Path $env:TEMP ('cap-out-' + [guid]::NewGuid().ToString('N') + '.txt')
     $errFile = Join-Path $env:TEMP ('cap-err-' + [guid]::NewGuid().ToString('N') + '.txt')
-    $result = [pscustomobject]@{ ExitCode = $null; StdOut = ''; StdErr = ''; TimedOut = $false }
+    $result = New-Object PSObject -Property @{ ExitCode = $null; StdOut = ''; StdErr = ''; TimedOut = $false }
 
     try {
-        $proc = Start-Process -FilePath $FilePath -ArgumentList $Arguments -NoNewWindow -PassThru `
-            -RedirectStandardOutput $outFile -RedirectStandardError $errFile
-        # 只等这一个进程。adb 会拉起常驻 server，且子进程会继承输出句柄，
-        # 因此不能用管道捕获，也不能用 Start-Process -Wait，否则会被 server 拖住。
+        if ($Arguments -and $Arguments.Count -gt 0) {
+            $proc = Start-Process -FilePath $FilePath -ArgumentList $Arguments -NoNewWindow -PassThru `
+                -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+        } else {
+            $proc = Start-Process -FilePath $FilePath -NoNewWindow -PassThru `
+                -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+        }
+        # 缓存进程句柄，避免 Windows PowerShell 2.0/5.1 下 WaitForExit 后 ExitCode 为 $null
+        $null = $proc.Handle
+        # 只等这一个进程，避免 adb server 继承句柄导致管道挂起
         if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
             $result.TimedOut = $true
             try { $proc.Kill() } catch { }
         } else {
+            $proc.WaitForExit()
             $result.ExitCode = $proc.ExitCode
         }
-        if (Test-Path -LiteralPath $outFile) { $result.StdOut = (Get-Content -LiteralPath $outFile -Raw -Encoding utf8) }
-        if (Test-Path -LiteralPath $errFile) { $result.StdErr = (Get-Content -LiteralPath $errFile -Raw -Encoding utf8) }
+        if (Test-Path -LiteralPath $outFile) {
+            $result.StdOut = [System.IO.File]::ReadAllText($outFile, [System.Text.Encoding]::UTF8)
+        }
+        if (Test-Path -LiteralPath $errFile) {
+            $result.StdErr = [System.IO.File]::ReadAllText($errFile, [System.Text.Encoding]::UTF8)
+        }
     } catch {
         $result.StdErr = $_.Exception.Message
     } finally {
@@ -288,7 +326,7 @@ function Invoke-ProcessCapture {
 
 function Get-AdbVersionInfo {
     param([string]$Exe)
-    $result = [pscustomobject]@{ Ok = $false; Build = $null; Raw = '' }
+    $result = New-Object PSObject -Property @{ Ok = $false; Build = $null; Raw = '' }
     if (-not $Exe -or -not (Test-Path -LiteralPath $Exe)) { return $result }
 
     $cap = Invoke-ProcessCapture -FilePath $Exe -Arguments @('version') -TimeoutSeconds 15
@@ -315,16 +353,6 @@ function Test-SamePath {
     catch { $false }
 }
 
-<#
-.SYNOPSIS
-    执行只读环境预检，返回结构化结论。
-.DESCRIPTION
-    关注「会影响其他服务 / 被其他服务影响」的四类东西：
-      - 5037 上的 adb server（谁起的、什么版本、会不会被本包客户端重启）
-      - 31416 上的 gnirehtet relay（残留或他人占用）
-      - PATH / 环境变量里会让 gnirehtet 用错 adb 的配置
-      - 本包自己的残留进程
-#>
 function Invoke-EnvPreflight {
     param([string]$Root = '')
     $Root = Resolve-PackageRoot -Root $Root
@@ -334,27 +362,33 @@ function Invoke-EnvPreflight {
     $pkgAdbVersion = Get-AdbVersionInfo -Exe $p.AdbExe
 
     # ---------------------------------------------------- 1) PATH 里的 adb
-    $pathAdbAll = @(Get-Command adb.exe -All -ErrorAction SilentlyContinue)
+    $pathAdbAll = @(Find-PathExecutables -FileName 'adb.exe')
     $pathAdb = if ($pathAdbAll.Count -gt 0) { $pathAdbAll[0] } else { $null }
 
     if (-not $pathAdb) {
         $findings.Add((New-Finding -Severity INFO -Id 'path-adb-none' `
             -Title 'PATH 中没有 adb.exe' `
             -Detail '直接双击或裸跑 gnirehtet.exe 时会找不到 adb（gnirehtet 调用的是 PATH 里的 adb）。' `
-            -Fix '用 scripts\gnirehtet.ps1 入口运行，它会临时把本包目录放到 PATH 最前面。'))
-    } elseif (Test-SamePath $pathAdb.Source $p.AdbExe) {
+            -Fix '直接双击根目录 gnirehtet.bat 运行，它会自动配置本包 adb。'))
+    } elseif (Test-SamePath $pathAdb $p.AdbExe) {
         $findings.Add((New-Finding -Severity INFO -Id 'path-adb-ok' `
             -Title 'PATH 优先命中本包 adb' `
             -Detail $p.AdbExe -Evidence @("$($pathAdbAll.Count) 个 adb 条目")))
     } else {
+        $extraPaths = @()
+        if ($pathAdbAll.Count -gt 1) {
+            for ($idx = 1; $idx -lt $pathAdbAll.Count; $idx++) {
+                $extraPaths += ('其次：' + $pathAdbAll[$idx])
+            }
+        }
         $findings.Add((New-Finding -Severity WARN -Id 'path-adb-other' `
             -Title 'PATH 里先命中的不是本包 adb' `
-            -Detail 'gnirehtet 通过 PATH 查找 adb，裸跑会用到下面这个二进制，可能与本包版本不一致。' `
-            -Fix '用 scripts\gnirehtet.ps1 入口运行（进程内临时置顶本包目录，不改系统 PATH）。' `
-            -Evidence (@($pathAdb.Source) + @($pathAdbAll | Select-Object -Skip 1 | ForEach-Object { '其次：' + $_.Source }))))
+            -Detail 'gnirehtet 默认通过 PATH 查找 adb，入口会在本次进程内自动置顶本包 adb。' `
+            -Fix '通过根目录 gnirehtet.bat 运行即可自动规避，不改系统 PATH。' `
+            -Evidence (@($pathAdb) + $extraPaths)))
     }
 
-    # ---------------------------------------------------- 2) adb server 端口（默认 5037，遵循 ANDROID_ADB_SERVER_PORT）
+    # ---------------------------------------------------- 2) adb server 端口（默认 5037）
     $adbPort = Get-AdbServerPort
     $server = @(Get-PortOwners -Port $adbPort -ListenOnly)
     if ($server.Count -eq 0) {
@@ -362,17 +396,19 @@ function Invoke-EnvPreflight {
             -Title "$adbPort 上没有 adb server 在跑" `
             -Detail '当前环境是干净的；实机时本包 adb 会自行拉起 server。'))
     } else {
-        $seenAdbPids = New-Object System.Collections.Generic.HashSet[int]
+        $seenAdbPids = @{}
         foreach ($s in $server) {
-            if ($s.PID -and -not $seenAdbPids.Add($s.PID)) { continue }
+            if ($s.PID) {
+                if ($seenAdbPids.ContainsKey($s.PID)) { continue }
+                $seenAdbPids[$s.PID] = $true
+            }
 
-            # 安全防线：只对确认是 adb.exe 的进程查询版本，绝不执行未知外部程序
             if ($s.Name -ine 'adb.exe') {
                 $procLabel = if ($s.Name) { $s.Name } else { '未知进程' }
                 $findings.Add((New-Finding -Severity BLOCKER -Id 'adb-port-non-adb' `
                     -Title "$adbPort 端口被非 adb 程序占用" `
                     -Detail "占用者：$procLabel（PID $($s.PID)）。不是 adb.exe，脚本不会调用它；adb 无法在此端口启动。" `
-                    -Fix '确认该服务可停后，运行 10_env_preflight.ps1 -Fix 交互关闭，或通过 ANDROID_ADB_SERVER_PORT 改用其它端口。' `
+                    -Fix '可以在入口选择换用隔离端口 5099 或关闭该进程。' `
                     -Evidence @("$($s.Local)  PID $($s.PID)  $($s.Path)")))
                 continue
             }
@@ -391,7 +427,7 @@ function Invoke-EnvPreflight {
                 $findings.Add((New-Finding -Severity WARN -Id 'adb-server-own' `
                     -Title '本包 adb server 残留' `
                     -Detail "PID $($s.PID) 由本包 adb 启动（端口 $adbPort），属于可安全回收的自身残留。$verNote" `
-                    -Fix '运行 10_env_preflight.ps1 -Apply 回收（只对本包 server 执行 kill-server）。' `
+                    -Fix '入口会自动复用或清理。' `
                     -Evidence @("$($s.Local)  PID $($s.PID)  $($s.Path)") -AutoFix))
             } else {
                 $sameVersion = ($srvVer.Ok -and $pkgAdbVersion.Ok -and $srvVer.Build -eq $pkgAdbVersion.Build)
@@ -399,9 +435,9 @@ function Invoke-EnvPreflight {
                     -Title $(if ($sameVersion) { "$adbPort 由其他工具启动，但版本一致" } else { "$adbPort 被其他 adb server 占用" }) `
                     -Detail "这是别的工具链（不是本包）启动的 server。$verNote$(if ($sameVersion) { ' 版本一致，可以直接共用，不会互相重启。' } else { ' 重启会打断对方正在进行的调试或安装。' })" `
                     -Fix $(if ($sameVersion) {
-                            '可以直接用；若想彻底隔开，可关闭对方服务后重跑体检。'
+                            '可以直接共用。'
                         } else {
-                            '先确认对方可以中断，再由人工执行：本包 tools\gnirehtet\adb.exe kill-server；不要交给自动化。'
+                            '可在入口直接选择换用隔离端口 5099 或关闭对方服务。'
                         }) `
                     -Evidence @("$($s.Local)  PID $($s.PID)  $($s.Path)")))
             }
@@ -414,14 +450,17 @@ function Invoke-EnvPreflight {
         $findings.Add((New-Finding -Severity INFO -Id 'port-31416-free' `
             -Title '31416 空闲' -Detail 'gnirehtet relay 默认端口可分配。'))
     } else {
-        $seen31416Pids = New-Object System.Collections.Generic.HashSet[int]
+        $seen31416Pids = @{}
         foreach ($s in $listen31416) {
-            if ($s.PID -and -not $seen31416Pids.Add($s.PID)) { continue }
+            if ($s.PID) {
+                if ($seen31416Pids.ContainsKey($s.PID)) { continue }
+                $seen31416Pids[$s.PID] = $true
+            }
             $isOwn = ($s.Name -ieq 'gnirehtet.exe')
             $findings.Add((New-Finding -Severity $(if ($isOwn) { 'WARN' } else { 'BLOCKER' }) -Id 'port-31416-busy' `
                 -Title '31416 已被占用' `
                 -Detail "占用者：$($s.Name)（PID $($s.PID)）。$($(if ($isOwn) { '看起来是本包 relay 残留。' } else { '不是 gnirehtet，启动 relay 会失败。' }))" `
-                -Fix $(if ($isOwn) { '确认为残留后由人工结束该进程。' } else { '由人工判断该服务是否可停；本包不会结束非 gnirehtet 进程。' }) `
+                -Fix $(if ($isOwn) { '入口会自动清理本包残留。' } else { '需要关闭占用 31416 的程序后继续。' }) `
                 -Evidence @("$($s.Local)  PID $($s.PID)  $($s.Path)")))
         }
     }
@@ -441,7 +480,7 @@ function Invoke-EnvPreflight {
         $findings.Add((New-Finding -Severity WARN -Id 'adb-multi' `
             -Title '同时存在多个不同路径的 adb 进程' `
             -Detail '多份 adb 共存时，"哪个 client 对应哪个 server" 很容易错位，表现为设备时有时无。' `
-            -Fix '实机只保留一份：关掉其他 adb 相关工具后重跑预检。' `
+            -Fix '建议只保留一份 adb 服务运行。' `
             -Evidence @($runningPaths)))
     }
 
@@ -471,11 +510,11 @@ function Invoke-EnvPreflight {
             -Title "已设置 ADB_VENDOR_KEYS = $($env:ADB_VENDOR_KEYS)" `
             -Detail '只影响授权密钥查找，不改变版本协商。'))
     }
-    foreach ($var in 'ANDROID_HOME', 'ANDROID_SDK_ROOT') {
+    foreach ($var in @('ANDROID_HOME', 'ANDROID_SDK_ROOT')) {
         if ([Environment]::GetEnvironmentVariable($var)) {
             $findings.Add((New-Finding -Severity INFO -Id "env-$var" `
                 -Title "$var = $([Environment]::GetEnvironmentVariable($var))" `
-                -Detail 'gnirehtet 不使用这些变量（它只按 PATH 找 adb），列出以避免误判。'))
+                -Detail 'gnirehtet 不使用这些变量（它只按 ADB 环境变量或 PATH 找 adb）。'))
         }
     }
 
@@ -485,7 +524,7 @@ function Invoke-EnvPreflight {
         $findings.Add((New-Finding -Severity WARN -Id 'gnirehtet-running' `
             -Title '已有 gnirehtet 进程在运行' `
             -Detail '重复启动会争用 31416；也可能是上次没有正常退出。' `
-            -Fix '确认没有正在进行的联调后，由人工结束；脚本不会自动结束它。' `
+            -Fix '入口会自动清理本包残留进程。' `
             -Evidence @($runningGn | ForEach-Object { "PID $($_.PID)  $($_.CommandLine)" })))
     }
 
@@ -494,15 +533,15 @@ function Invoke-EnvPreflight {
         $findings.Add((New-Finding -Severity WARN -Id 'pkg-adb-broken' `
             -Title '本包 adb 无法返回版本' `
             -Detail ($pkgAdbVersion.Raw -replace '\s+', ' ') `
-            -Fix '重跑 build_package.ps1 重建工具包。'))
+            -Fix 'Windows 7 老环境可能缺少运行库，入口会自动安装 deps\vc_redist.x86.exe。'))
     }
 
     # ---------------------------------------------------- 汇总
-    $blockers = @($findings | Where-Object Severity -eq 'BLOCKER')
-    $warns    = @($findings | Where-Object Severity -eq 'WARN')
-    $infos    = @($findings | Where-Object Severity -eq 'INFO')
+    $blockers = @($findings | Where-Object { $_.Severity -eq 'BLOCKER' })
+    $warns    = @($findings | Where-Object { $_.Severity -eq 'WARN' })
+    $infos    = @($findings | Where-Object { $_.Severity -eq 'INFO' })
 
-    [pscustomobject]@{
+    New-Object PSObject -Property @{
         Root        = $Root
         Paths       = $p
         AdbVersion  = $pkgAdbVersion

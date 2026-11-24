@@ -1,51 +1,87 @@
 {
-  "createdAt": "2026-11-22 21:40:24 +08:00",
-  "os": "Microsoft Windows 10.0.26200",
-  "gnirehtetVersion": "2.5.1",
-  "archives": [
-    {
-      "file": "gnirehtet-rust-win64-v2.5.1.zip",
-      "url": "https://github.com/Genymobile/gnirehtet/releases/download/v2.5.1/gnirehtet-rust-win64-v2.5.1.zip",
-      "bytes": 891262,
-      "sha256": "7f5b1063e7895182aa60def1437e50363c3758144088dcd079037bb7c3c46a1c"
-    },
-    {
-      "file": "platform-tools-latest-windows.zip",
-      "url": "https://dl.google.com/android/repository/platform-tools-latest-windows.zip",
-      "bytes": 8188601,
-      "sha256": "89d108360a3bf2924d3bea837239edaccc22fd6ff5befd3787c4348a9fe4f09d"
-    }
-  ],
-  "tools": [
-    {
-      "file": "adb.exe",
-      "bytes": 8659608,
-      "sha256": "bae5ce98846b19caa74a34900850caa8b21d01976932b2ad83baeb5de5651aee"
-    },
-    {
-      "file": "AdbWinApi.dll",
-      "bytes": 108184,
-      "sha256": "ed20abfb8b423029a2278d3947c1a1235774afd1b0e0e08405591e6f1d237a49"
-    },
-    {
-      "file": "AdbWinUsbApi.dll",
-      "bytes": 73368,
-      "sha256": "ac658211ac7991ce581f4f2efff86358abdca8eb1bc0f38d7686cbf4215f7c1f"
-    },
-    {
-      "file": "gnirehtet-run.cmd",
-      "bytes": 28,
-      "sha256": "d6f5fa61274fae5a47490896a75b8ba72b1f0bd5cf7d458fcdfac1c192c223b5"
-    },
-    {
-      "file": "gnirehtet.apk",
-      "bytes": 23904,
-      "sha256": "c1ac2b869a48e3c836046aac5a168f3ade510288f3304a87ddb671315c564b9a"
-    },
-    {
-      "file": "gnirehtet.exe",
-      "bytes": 2991788,
-      "sha256": "d5daefbb48143fbc2b01f24be79135fc11959fe4553b00f5a454801ed5ff720d"
-    }
-  ]
+    "archives":  [
+                     {
+                         "url":  "https://github.com/Genymobile/gnirehtet/releases/download/v2.5.1/gnirehtet-rust-win64-v2.5.1.zip",
+                         "file":  "gnirehtet-rust-win64-v2.5.1.zip",
+                         "bytes":  891262,
+                         "sha256":  "7f5b1063e7895182aa60def1437e50363c3758144088dcd079037bb7c3c46a1c"
+                     },
+                     {
+                         "url":  "https://dl.google.com/android/repository/platform-tools_r33.0.3-windows.zip",
+                         "file":  "platform-tools_r33.0.3-windows.zip",
+                         "bytes":  5642796,
+                         "sha256":  "1e59afd40a74c5c0eab0a9fad3f0faf8a674267106e0b19921be9f67081808c2"
+                     },
+                     {
+                         "url":  "https://aka.ms/vs/17/release/vc_redist.x86.exe",
+                         "file":  "vc_redist.x86.exe",
+                         "bytes":  13953392,
+                         "sha256":  "0c09f2611660441084ce0df425c51c11e147e6447963c3690f97e0b25c55ed64"
+                     },
+                     {
+                         "url":  "https://dl.google.com/android/repository/latest_usb_driver_windows.zip",
+                         "file":  "latest_usb_driver_windows.zip",
+                         "bytes":  8682859,
+                         "sha256":  "1ee1d023a99ffac962af4454eb9b9900f6858c687b4d5311e8fb361548d6c078"
+                     },
+                     {
+                         "url":  "https://github.com/koush/adb.clockworkmod.com/releases/latest/download/UniversalAdbDriverSetup.msi",
+                         "file":  "UniversalAdbDriverSetup.msi",
+                         "bytes":  17060864,
+                         "sha256":  "4e77e303bba6cf84588bdb6da91f7a875d406f7930cbe9f4d2aae0b643c0c928"
+                     }
+                 ],
+    "createdAt":  "2026-11-24 23:22:47 +08:00",
+    "deps":  [
+                 {
+                     "sha256":  "0c09f2611660441084ce0df425c51c11e147e6447963c3690f97e0b25c55ed64",
+                     "file":  "vc_redist.x86.exe",
+                     "bytes":  13953392
+                 },
+                 {
+                     "sha256":  "4e77e303bba6cf84588bdb6da91f7a875d406f7930cbe9f4d2aae0b643c0c928",
+                     "file":  "UniversalAdbDriverSetup.msi",
+                     "bytes":  17060864
+                 },
+                 {
+                     "sha256":  "7984d14af8ebce8255448aa728a5436916fccb36d1814516301f04a7dea2a666",
+                     "file":  "google-usb-driver/android_winusb.inf",
+                     "bytes":  5917
+                 }
+             ],
+    "tools":  [
+                  {
+                      "sha256":  "bce1f6f6f6532266837b66d719bfbd177d406d6d7d8d5adfd5e7c59fcde651a5",
+                      "file":  "adb.exe",
+                      "bytes":  5992960
+                  },
+                  {
+                      "sha256":  "d60103a5e99bc9888f786ee916f5d6e45493c3247972cb053833803de7e95cf9",
+                      "file":  "AdbWinApi.dll",
+                      "bytes":  97792
+                  },
+                  {
+                      "sha256":  "25207c506d29c4e8dceb61b4bd50e8669ba26012988a43fbf26a890b1e60fc97",
+                      "file":  "AdbWinUsbApi.dll",
+                      "bytes":  62976
+                  },
+                  {
+                      "sha256":  "c1ac2b869a48e3c836046aac5a168f3ade510288f3304a87ddb671315c564b9a",
+                      "file":  "gnirehtet.apk",
+                      "bytes":  23904
+                  },
+                  {
+                      "sha256":  "d5daefbb48143fbc2b01f24be79135fc11959fe4553b00f5a454801ed5ff720d",
+                      "file":  "gnirehtet.exe",
+                      "bytes":  2991788
+                  },
+                  {
+                      "sha256":  "d6f5fa61274fae5a47490896a75b8ba72b1f0bd5cf7d458fcdfac1c192c223b5",
+                      "file":  "gnirehtet-run.cmd",
+                      "bytes":  28
+                  }
+              ],
+    "platformToolsVersion":  "33.0.3",
+    "gnirehtetVersion":  "2.5.1",
+    "os":  "Microsoft Windows 10.0.26200"
 }
