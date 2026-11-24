@@ -30,10 +30,11 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('auto', 'run', 'status', 'install', 'stop', 'install-deps', 'preflight', 'verify')]
+    [ValidateSet('auto', 'run', 'status', 'install', 'stop', 'install-deps', 'elevated-deps', 'preflight', 'verify')]
     [string]$Action = 'auto',
     [string]$Root = '',
     [string]$Serial = '',
+    [string]$DepsStateFile = '',
     [switch]$Yes,
     [switch]$Force,
     [switch]$PauseOnExit
@@ -316,17 +317,24 @@ function Wait-AndResolveDevice {
                 Write-Host '[驱动] 正在自动为这台手机安装通用 Android ADB 驱动（含 Class_FF 通配与当前设备 ID）……' -ForegroundColor Cyan
                 $drvRes = Install-BundledDeps -Root $Root -InstallDrivers -ExtraHardwareIds $extraHids
                 $driverInstalledThisRun = $true
-                if ($drvRes.Ok) {
-                    Write-Host '[通过] 通用 ADB 驱动安装命令已执行完毕！' -ForegroundColor Green
-                    Write-Host '       请拔掉手机数据线重新插上（或在手机下拉通知栏切换一次「传输文件 / 仅充电」）。' -ForegroundColor Yellow
-                } else {
-                    Write-Host '[提示] 自动安装驱动未完成（可能取消了管理员授权），请右键以管理员身份运行 gnirehtet.bat。' -ForegroundColor Yellow
-                }
                 if ($drvRes.Log) {
-                    $summary = @($drvRes.Log -split "`r?`n" | Where-Object { $_ -match 'PNP_UNIVERSAL_EXIT|UNI_DRV_EXIT|发布名称|Published|已添加|Added|失败|Failed|错误' } | Select-Object -First 6)
-                    if ($summary.Count -gt 0) {
+                    $logLines = @($drvRes.Log -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 10)
+                    if ($logLines.Count -gt 0) {
                         Write-Host '  驱动安装反馈：' -ForegroundColor DarkGray
-                        foreach ($sl in $summary) { Write-Host ('    ' + $sl.Trim()) -ForegroundColor DarkGray }
+                        foreach ($sl in $logLines) { Write-Host ('    ' + $sl.Trim()) -ForegroundColor DarkGray }
+                    }
+                }
+                if ($drvRes.Ok) {
+                    Write-Host '[通过] 驱动安装完成，正在重新扫描手机……' -ForegroundColor Green
+                    Start-Sleep -Seconds 2
+                    try { Invoke-ProcessCapture -FilePath $p.AdbExe -Arguments @('kill-server') -TimeoutSeconds 10 | Out-Null } catch { }
+                    Initialize-AdbServer -AdbExe $p.AdbExe | Out-Null
+                    continue
+                } else {
+                    if (Test-IsAdministrator) {
+                        Write-Host '[提示] 驱动绑定返回失败，请查看上方错误码（如系统拦截未签名驱动，可在开机按 F8 选禁用驱动程序签名强制，或手动安装摩托罗拉/联想官方驱动）。' -ForegroundColor Yellow
+                    } else {
+                        Write-Host '[提示] 自动安装驱动未完成（可能取消了管理员授权），请右键以管理员身份运行 gnirehtet.bat。' -ForegroundColor Yellow
                     }
                 }
             }
@@ -360,6 +368,33 @@ if ($missingTools.Count -gt 0) {
     }
     Write-Host '请确认整包已完整解压，或运行 scripts\build_package.ps1 重建工具包。' -ForegroundColor Yellow
     Exit-Clean 2
+}
+
+# 内部提权子流程：供非管理员进程通过 RunAs 调用，执行完毕将结果写回状态文件
+if ($Action -eq 'elevated-deps') {
+    $runRt = $false
+    $runDrv = $false
+    $hids = New-Object System.Collections.Generic.List[string]
+    if ($DepsStateFile -and (Test-Path -LiteralPath $DepsStateFile -PathType Leaf)) {
+        $reqLines = [System.IO.File]::ReadAllLines($DepsStateFile, [System.Text.Encoding]::UTF8)
+        foreach ($rl in $reqLines) {
+            if ($rl -eq 'RUNTIME=1') { $runRt = $true }
+            elseif ($rl -eq 'DRIVERS=1') { $runDrv = $true }
+            elseif ($rl.StartsWith('HWID=')) { $hids.Add($rl.Substring(5)) }
+        }
+    }
+    $w = Invoke-BundledDepsElevatedWorker -Root $Root -InstallRuntime:$runRt -InstallDrivers:$runDrv -ExtraHardwareIds $hids.ToArray()
+    if ($DepsStateFile) {
+        $out = New-Object System.Collections.Generic.List[string]
+        $out.Add('RESULT_OK=' + $(if ($w.Ok) { '1' } else { '0' }))
+        $out.Add('REBOOT=' + $(if ($w.RebootSuggested) { '1' } else { '0' }))
+        foreach ($ln in $w.Lines) {
+            $out.Add('LOG=' + $ln)
+        }
+        [System.IO.File]::WriteAllLines($DepsStateFile, $out.ToArray(), (New-Object System.Text.UTF8Encoding($false)))
+    }
+    if (-not $w.Ok) { Start-Sleep -Seconds 3 }
+    if ($w.Ok) { exit 0 } else { exit 2 }
 }
 
 # 快捷子命令：install-deps / verify / preflight

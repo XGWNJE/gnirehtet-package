@@ -11,7 +11,9 @@ if not exist "%ENTRY_PS1%" (
 )
 
 set "PS_EXE="
-if exist "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" (
+if exist "%SystemRoot%\Sysnative\WindowsPowerShell\v1.0\powershell.exe" (
+    set "PS_EXE=%SystemRoot%\Sysnative\WindowsPowerShell\v1.0\powershell.exe"
+) else if exist "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" (
     set "PS_EXE=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 ) else (
     where powershell.exe >nul 2>nul

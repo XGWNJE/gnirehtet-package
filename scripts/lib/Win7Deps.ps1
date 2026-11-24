@@ -6,9 +6,12 @@
       2. 检测本包 adb.exe 能否正常运行（缺 UCRT / VC++ 运行库时会失败）
       3. 检测设备管理器中是否存在缺少驱动的 Android / USB 设备，并提取硬件 ID（VID/PID/MI）
       4. 自动安装内置微软运行库（vc_redist.x86.exe）与通用 Android ADB USB 驱动：
-         - 自动基于 Google 官方 WinUSB 驱动包，生成包含通用 ADB 类 ID（USB\Class_FF&SubClass_42&Prot_01）
-           及当前缺失驱动手机真实 VID/PID 的 INF，前台调用 pnputil -i -a 绑定到微软原装 WinUSB.sys
+         - 在当前管理员进程（或提权子进程）中直接执行，不拼接临时 .cmd 批处理
+         - 直接调用系统 newdev.dll!UpdateDriverForPlugAndPlayDevices 强制绑定通用 WinUSB INF
+         - 再调用 pnputil -i -a 写入系统驱动库；仅当仍有异常设备时再跑 UniversalAdbDriverSetup.msi 兜底
 #>
+
+$script:Win7DepsLibDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 function Test-IsLegacyWindows {
     $v = [Environment]::OSVersion.Version
@@ -54,7 +57,25 @@ function Get-BrokenAndroidUsbDevices {
                 if ($pnp -match '^(USB\\VID_[0-9A-Fa-f]{4}&PID_[0-9A-Fa-f]{4}(?:&MI_[0-9A-Fa-f]{2})?)') {
                     $hwId = $Matches[1].ToUpperInvariant()
                 }
-                $isUsb = ($pnp -match '^USB\\')
+                if (-not $hwId -and $dev.HardwareID) {
+                    foreach ($h in @($dev.HardwareID)) {
+                        $hs = [string]$h
+                        if ($hs -match '^USB\\VID_[0-9A-Fa-f]{4}&PID_[0-9A-Fa-f]{4}(?:&MI_[0-9A-Fa-f]{2})?') {
+                            $hwId = $Matches[0].ToUpperInvariant()
+                            break
+                        }
+                    }
+                    if (-not $hwId) {
+                        foreach ($h in @($dev.HardwareID)) {
+                            $hs = [string]$h
+                            if ($hs -match '^USB\\') {
+                                $hwId = $hs.ToUpperInvariant()
+                                break
+                            }
+                        }
+                    }
+                }
+                $isUsb = ($pnp -match '^USB\\') -or ($hwId -match '^USB\\')
                 $isCandidate = $isUsb -or ($name -match 'Android|ADB|Composite|MTP|Phone|Xiaomi|Redmi|Huawei|Honor|OPPO|vivo|OnePlus|Samsung|Pixel|未知设备|Unknown')
                 if ($isCandidate) {
                     $list.Add((New-Object PSObject -Property @{
@@ -137,6 +158,211 @@ function New-UniversalAdbInfPackage {
     })
 }
 
+function Ensure-Win7NewDevType {
+    if (-not ('Win7NewDev' -as [type])) {
+        $src = @'
+using System;
+using System.Runtime.InteropServices;
+public static class Win7NewDev {
+    [DllImport("newdev.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern bool UpdateDriverForPlugAndPlayDevices(
+        IntPtr hwndParent,
+        string HardwareId,
+        string FullInfPath,
+        uint InstallFlags,
+        out bool bRebootRequired
+    );
+}
+'@
+        Add-Type -TypeDefinition $src -ErrorAction Stop
+    }
+}
+
+function Invoke-BindDriverToHardwareId {
+    param(
+        [string]$HardwareId,
+        [string]$InfPath
+    )
+    $res = New-Object PSObject -Property @{
+        Ok           = $false
+        Reboot       = $false
+        ErrorCodeHex = ''
+        ErrorMessage = ''
+    }
+    try {
+        Ensure-Win7NewDevType
+        $reboot = $false
+        # INSTALLFLAG_FORCE = 1：强制将匹配硬件 ID 的设备绑定到指定 WinUSB INF
+        $ok = [Win7NewDev]::UpdateDriverForPlugAndPlayDevices([IntPtr]::Zero, $HardwareId, $InfPath, 1, [ref]$reboot)
+        if ($ok) {
+            $res.Ok = $true
+            $res.Reboot = [bool]$reboot
+        } else {
+            $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            $uerr = $err -band 0xFFFFFFFFL
+            $res.ErrorCodeHex = ('0x{0:X8}' -f $uerr)
+            try {
+                $res.ErrorMessage = (New-Object System.ComponentModel.Win32Exception($err)).Message
+            } catch {
+                $res.ErrorMessage = ('Win32 error ' + $res.ErrorCodeHex)
+            }
+        }
+    } catch {
+        $res.ErrorCodeHex = 'EXCEPTION'
+        $res.ErrorMessage = $_.Exception.Message
+    }
+    return $res
+}
+
+function Start-ProcessGetExitCode {
+    param(
+        [string]$FilePath,
+        [string]$Arguments = '',
+        [switch]$CaptureOutput
+    )
+    $out = New-Object PSObject -Property @{
+        ExitCode = -1
+        StdOut   = ''
+        StdErr   = ''
+    }
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $FilePath
+    $psi.Arguments = $Arguments
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    if ($CaptureOutput) {
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+    }
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    if ($null -eq $proc) {
+        $out.StdErr = ('无法启动进程：' + $FilePath)
+        return $out
+    }
+    $null = $proc.Handle
+    if ($CaptureOutput) {
+        $out.StdOut = $proc.StandardOutput.ReadToEnd()
+        $out.StdErr = $proc.StandardError.ReadToEnd()
+    }
+    $proc.WaitForExit()
+    $out.ExitCode = [int]$proc.ExitCode
+    return $out
+}
+
+function Invoke-BundledDepsElevatedWorker {
+    param(
+        [string]$Root,
+        [switch]$InstallRuntime,
+        [switch]$InstallDrivers,
+        [string[]]$ExtraHardwareIds = @()
+    )
+
+    $info = Get-BundledDepsInfo -Root $Root
+    $lines = New-Object System.Collections.Generic.List[string]
+    $runtimeOk = $true
+    $driverOk  = $true
+    $rebootSuggested = $false
+    $tempDriverPkg = $null
+
+    function Add-WorkerLog {
+        param([string]$Text)
+        $lines.Add($Text)
+        Write-Host ('  ' + $Text) -ForegroundColor DarkGray
+    }
+
+    try {
+        if ($InstallRuntime) {
+            $runtimeOk = $false
+            if (-not $info.HasVcRedist) {
+                Add-WorkerLog '[运行库] 包内缺少 deps\vc_redist.x86.exe'
+            } else {
+                Add-WorkerLog '[运行库] 正在静默安装 Microsoft VC++ Runtime (x86 / Win7 UCRT)...'
+                $r = Start-ProcessGetExitCode -FilePath $info.VcRedistExe -Arguments '/install /quiet /norestart'
+                Add-WorkerLog ('VC_EXIT=' + $r.ExitCode)
+                if ($r.ExitCode -eq 0 -or $r.ExitCode -eq 1638 -or $r.ExitCode -eq 3010) {
+                    $runtimeOk = $true
+                    if ($r.ExitCode -eq 3010) { $rebootSuggested = $true }
+                }
+            }
+        }
+
+        if ($InstallDrivers) {
+            $driverOk = $false
+            if ($info.HasGoogleInf) {
+                $tempDriverPkg = New-UniversalAdbInfPackage -GoogleDir $info.GoogleDir -ExtraHardwareIds $ExtraHardwareIds
+                $infPath = $tempDriverPkg.InfPath
+
+                # 1. 若有已知硬件 ID，直接调用系统 newdev.dll 强制绑定（对 Error 28 最有效）
+                if ($ExtraHardwareIds -and $ExtraHardwareIds.Count -gt 0) {
+                    foreach ($hid in $ExtraHardwareIds) {
+                        if (-not $hid) { continue }
+                        Add-WorkerLog ('[驱动] 正在直接绑定设备 ' + $hid + ' ...')
+                        $bindRes = Invoke-BindDriverToHardwareId -HardwareId $hid -InfPath $infPath
+                        if ($bindRes.Ok) {
+                            $driverOk = $true
+                            if ($bindRes.Reboot) { $rebootSuggested = $true }
+                            Add-WorkerLog ('NEWDEV_BIND_OK=' + $hid + ' (Reboot=' + $bindRes.Reboot + ')')
+                        } else {
+                            Add-WorkerLog ('NEWDEV_BIND_FAIL=' + $hid + ' Code=' + $bindRes.ErrorCodeHex + ' Msg=' + $bindRes.ErrorMessage)
+                        }
+                    }
+                }
+
+                # 2. 调用 pnputil 将通用驱动加入系统 DriverStore
+                $pnputil = Join-Path $env:windir 'Sysnative\pnputil.exe'
+                if (-not (Test-Path -LiteralPath $pnputil -PathType Leaf)) {
+                    $pnputil = Join-Path $env:windir 'System32\pnputil.exe'
+                }
+                if (Test-Path -LiteralPath $pnputil -PathType Leaf) {
+                    Add-WorkerLog '[驱动] 正在通过 pnputil 预存通用 ADB 驱动包...'
+                    $pr = Start-ProcessGetExitCode -FilePath $pnputil -Arguments ('-i -a "' + $infPath + '"') -CaptureOutput
+                    Add-WorkerLog ('PNP_UNIVERSAL_EXIT=' + $pr.ExitCode)
+                    $pnpText = (($pr.StdOut + "`n" + $pr.StdErr).Trim())
+                    if ($pnpText) {
+                        foreach ($pl in ($pnpText -split "`r?`n")) {
+                            if ($pl.Trim()) { Add-WorkerLog ('pnputil: ' + $pl.Trim()) }
+                        }
+                    }
+                    if ($pr.ExitCode -eq 0 -or $pr.ExitCode -eq 259 -or $pr.ExitCode -eq 3010) {
+                        $driverOk = $true
+                        if ($pr.ExitCode -eq 3010) { $rebootSuggested = $true }
+                    }
+                } else {
+                    Add-WorkerLog ('[驱动] 未找到 pnputil.exe：' + $pnputil)
+                }
+            }
+
+            # 3. 仅当上述步骤后仍检测到异常 USB 设备时，运行 UniversalAdbDriverSetup.msi 作为补充
+            $stillBroken = @(Get-BrokenAndroidUsbDevices)
+            if ((-not $driverOk -or $stillBroken.Count -gt 0) -and $info.HasUniversal) {
+                Add-WorkerLog '[驱动] 正在运行 UniversalAdbDriverSetup.msi 补充驱动...'
+                $mr = Start-ProcessGetExitCode -FilePath 'msiexec.exe' -Arguments ('/i "' + $info.UniversalMsi + '" /qn /norestart')
+                Add-WorkerLog ('UNI_DRV_EXIT=' + $mr.ExitCode)
+                if ($mr.ExitCode -eq 0 -or $mr.ExitCode -eq 3010) {
+                    $driverOk = $true
+                    if ($mr.ExitCode -eq 3010) { $rebootSuggested = $true }
+                }
+            }
+        }
+    } finally {
+        if ($tempDriverPkg -and (Test-Path -LiteralPath $tempDriverPkg.StageDir)) {
+            Remove-Item -LiteralPath $tempDriverPkg.StageDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    $overallOk = $true
+    if ($InstallRuntime -and -not $runtimeOk) { $overallOk = $false }
+    if ($InstallDrivers -and -not $driverOk)  { $overallOk = $false }
+
+    return (New-Object PSObject -Property @{
+        Ok              = $overallOk
+        RuntimeOk       = $runtimeOk
+        DriverOk        = $driverOk
+        RebootSuggested = $rebootSuggested
+        Lines           = $lines.ToArray()
+    })
+}
+
 function Install-BundledDeps {
     param(
         [string]$Root,
@@ -148,92 +374,83 @@ function Install-BundledDeps {
     $info = Get-BundledDepsInfo -Root $Root
     $result = New-Object PSObject -Property @{
         Ok              = $false
-        RuntimeAttempt  = $false
-        DriverAttempt   = $false
+        RuntimeAttempt  = [bool]$InstallRuntime
+        DriverAttempt   = [bool]$InstallDrivers
         RebootSuggested = $false
         Log             = ''
     }
 
-    $tempDriverPkg = $null
-    $commands = New-Object System.Collections.Generic.List[string]
-
-    if ($InstallRuntime -and $info.HasVcRedist) {
-        $result.RuntimeAttempt = $true
-        $vcPath = $info.VcRedistExe
-        $commands.Add('echo [1] Installing Microsoft VC++ Runtime (x86 / Win7 UCRT)...')
-        $commands.Add('"' + $vcPath + '" /install /quiet /norestart')
-        $commands.Add('echo VC_EXIT=%errorlevel%')
-    }
-
-    if ($InstallDrivers) {
-        if ($info.HasGoogleInf) {
-            $result.DriverAttempt = $true
-            $tempDriverPkg = New-UniversalAdbInfPackage -GoogleDir $info.GoogleDir -ExtraHardwareIds $ExtraHardwareIds
-            $infPath = $tempDriverPkg.InfPath
-            $commands.Add('echo [2] Installing Universal Android ADB Driver (WinUSB Class_FF + Device VID/PID)...')
-            $commands.Add('"%SystemRoot%\System32\pnputil.exe" -i -a "' + $infPath + '"')
-            $commands.Add('echo PNP_UNIVERSAL_EXIT=%errorlevel%')
-        }
-        if ($info.HasUniversal) {
-            $result.DriverAttempt = $true
-            $msiPath = $info.UniversalMsi
-            $commands.Add('echo [3] Installing ClockworkMod Universal ADB Driver...')
-            $commands.Add('msiexec.exe /i "' + $msiPath + '" /qn /norestart')
-            $commands.Add('echo UNI_DRV_EXIT=%errorlevel%')
-        }
-    }
-
-    if (-not $result.RuntimeAttempt -and -not $result.DriverAttempt) {
+    if ((-not $InstallRuntime -or -not $info.HasVcRedist) -and (-not $InstallDrivers -or (-not $info.HasGoogleInf -and -not $info.HasUniversal))) {
         $result.Log = '包内 deps\ 目录没有找到可安装的离线依赖文件。'
         return $result
     }
 
-    $stamp = [guid]::NewGuid().ToString('N')
-    $batchFile = Join-Path $env:TEMP ('gnirehtet-deps-' + $stamp + '.cmd')
-    $logFile   = Join-Path $env:TEMP ('gnirehtet-deps-' + $stamp + '.log')
-
-    $wrapper = New-Object System.Collections.Generic.List[string]
-    $wrapper.Add('@echo off')
-    $wrapper.Add('(')
-    foreach ($line in $commands) {
-        $wrapper.Add('  ' + $line)
+    if ($InstallDrivers) {
+        Write-Host '  提示：如 Windows 弹出「Windows 安全」红框，请点击「始终安装此驱动程序软件」。' -ForegroundColor Yellow
     }
-    $wrapper.Add(') > "' + $logFile + '" 2>&1')
-    $wrapper.Add('exit /b 0')
+
+    # 已是管理员：直接在当前进程内执行，无子进程、无 .cmd 语法隐患
+    if (Test-IsAdministrator) {
+        $w = Invoke-BundledDepsElevatedWorker -Root $Root -InstallRuntime:$InstallRuntime -InstallDrivers:$InstallDrivers -ExtraHardwareIds $ExtraHardwareIds
+        $result.Ok = [bool]$w.Ok
+        $result.RebootSuggested = [bool]$w.RebootSuggested
+        $result.Log = ($w.Lines -join "`r`n")
+        return $result
+    }
+
+    # 非管理员：通过临时状态文件唤起提权 PowerShell 执行 -Action elevated-deps
+    $stamp = [guid]::NewGuid().ToString('N')
+    $stateFile = Join-Path $env:TEMP ('gnirehtet-deps-state-' + $stamp + '.txt')
+    $reqLines = New-Object System.Collections.Generic.List[string]
+    $reqLines.Add('RUNTIME=' + $(if ($InstallRuntime) { '1' } else { '0' }))
+    $reqLines.Add('DRIVERS=' + $(if ($InstallDrivers) { '1' } else { '0' }))
+    foreach ($hid in $ExtraHardwareIds) {
+        if ($hid) { $reqLines.Add('HWID=' + $hid) }
+    }
 
     try {
-        [System.IO.File]::WriteAllLines($batchFile, $wrapper.ToArray(), [System.Text.Encoding]::Default)
+        [System.IO.File]::WriteAllLines($stateFile, $reqLines.ToArray(), (New-Object System.Text.UTF8Encoding($false)))
 
-        $isAdmin = Test-IsAdministrator
-        # 注意：安装驱动时不使用 Hidden，避免 Windows 7 弹出「始终安装此驱动程序软件」安全确认框被隐藏
-        $winStyle = if ($InstallDrivers) { 'Normal' } else { 'Hidden' }
-
-        if ($InstallDrivers) {
-            Write-Host '  提示：如 Windows 弹出「无法验证驱动程序发布者」红框，请点击「始终安装此驱动程序软件」。' -ForegroundColor Yellow
+        $psExe = Join-Path $PSHome 'powershell.exe'
+        if (-not (Test-Path -LiteralPath $psExe -PathType Leaf)) {
+            $psExe = 'powershell.exe'
         }
+        $entryPs1 = Join-Path (Split-Path -Parent $script:Win7DepsLibDir) 'gnirehtet.ps1'
 
-        if ($isAdmin) {
-            $p = Start-Process -FilePath 'cmd.exe' -ArgumentList ('/c "' + $batchFile + '"') -Wait -PassThru -WindowStyle $winStyle
-        } else {
-            Write-Host '  需要管理员权限来安装系统运行库/驱动，请在弹出的权限提示中点击「是」……' -ForegroundColor Yellow
-            $p = Start-Process -FilePath 'cmd.exe' -ArgumentList ('/c "' + $batchFile + '"') -Verb RunAs -Wait -PassThru -WindowStyle $winStyle
-        }
+        Write-Host '  需要管理员权限来安装系统运行库/驱动，请在弹出的权限提示中点击「是」……' -ForegroundColor Yellow
+        $argArr = @(
+            '-NoProfile',
+            '-ExecutionPolicy', 'Bypass',
+            '-File', ('"' + $entryPs1 + '"'),
+            '-Action', 'elevated-deps',
+            '-Root', ('"' + $Root + '"'),
+            '-DepsStateFile', ('"' + $stateFile + '"')
+        )
+        $null = Start-Process -FilePath $psExe -ArgumentList $argArr -Verb RunAs -Wait
 
-        if (Test-Path -LiteralPath $logFile) {
-            $result.Log = [System.IO.File]::ReadAllText($logFile, [System.Text.Encoding]::Default)
-            if ($result.Log -match 'VC_EXIT=3010' -or $result.Log -match 'UNI_DRV_EXIT=3010') {
-                $result.RebootSuggested = $true
+        if (Test-Path -LiteralPath $stateFile) {
+            $outLines = [System.IO.File]::ReadAllLines($stateFile, [System.Text.Encoding]::UTF8)
+            $logList = New-Object System.Collections.Generic.List[string]
+            $sawResult = $false
+            foreach ($ol in $outLines) {
+                if ($ol -eq 'RESULT_OK=1') { $result.Ok = $true; $sawResult = $true }
+                elseif ($ol -eq 'RESULT_OK=0') { $result.Ok = $false; $sawResult = $true }
+                elseif ($ol -eq 'REBOOT=1') { $result.RebootSuggested = $true }
+                elseif ($ol.StartsWith('LOG=')) { $logList.Add($ol.Substring(4)) }
             }
+            if (-not $sawResult) {
+                $result.Log = '未授予管理员权限或提权子进程被取消。'
+            } else {
+                $result.Log = ($logList.ToArray() -join "`r`n")
+            }
+        } else {
+            $result.Log = '未生成提权状态文件（可能取消了 UAC 授权）。'
         }
-        $result.Ok = ($null -ne $p -and $p.ExitCode -eq 0)
     } catch {
         $result.Log = $_.Exception.Message
         $result.Ok = $false
     } finally {
-        Remove-Item -LiteralPath $batchFile, $logFile -Force -ErrorAction SilentlyContinue
-        if ($tempDriverPkg -and (Test-Path -LiteralPath $tempDriverPkg.StageDir)) {
-            Remove-Item -LiteralPath $tempDriverPkg.StageDir -Recurse -Force -ErrorAction SilentlyContinue
-        }
+        Remove-Item -LiteralPath $stateFile -Force -ErrorAction SilentlyContinue
     }
 
     return $result
