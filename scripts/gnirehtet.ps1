@@ -295,33 +295,51 @@ function Wait-AndResolveDevice {
             return $null
         }
 
-        # 没找到设备时：针对 Windows 7 或存在异常 USB/Android 设备，自动安装内置 USB 驱动
+        # 没找到设备时：针对 Windows 7 或存在异常 USB/Android 设备，自动安装内置通用 ADB 驱动
+        $brokenUsb = @(Get-BrokenAndroidUsbDevices)
+        if ($brokenUsb.Count -gt 0) {
+            Write-Host ''
+            Write-Host '[诊断] 设备管理器中发现以下缺少驱动的 USB/手机接口：' -ForegroundColor Yellow
+            foreach ($b in $brokenUsb) {
+                $bName = if ($b.Name) { $b.Name } else { '未知设备' }
+                $bId   = if ($b.HardwareId) { $b.HardwareId } else { $b.DeviceId }
+                Write-Host ("  · {0}  [{1}] (错误码 {2})" -f $bName, $bId, $b.ErrorCode) -ForegroundColor DarkGray
+            }
+        }
+
         if (-not $driverInstalledThisRun) {
             $isWin7 = Test-IsLegacyWindows
-            $brokenUsb = @(Get-BrokenAndroidUsbDevices)
             $depsInfo = Get-BundledDepsInfo -Root $Root
             if (($isWin7 -or $brokenUsb.Count -gt 0) -and ($depsInfo.HasGoogleInf -or $depsInfo.HasUniversal)) {
+                $extraHids = @($brokenUsb | Where-Object { $_.HardwareId } | ForEach-Object { $_.HardwareId })
                 Write-Host ''
-                if ($brokenUsb.Count -gt 0) {
-                    Write-Host '[驱动] 检测到电脑中有缺少驱动的 USB/手机设备，正在自动安装内置 Android USB 驱动……' -ForegroundColor Cyan
-                } else {
-                    Write-Host '[驱动] 当前为 Windows 7 老系统且尚未识别手机，正在自动安装内置 Android USB 驱动……' -ForegroundColor Cyan
-                }
-                $drvRes = Install-BundledDeps -Root $Root -InstallDrivers
+                Write-Host '[驱动] 正在自动为这台手机安装通用 Android ADB 驱动（含 Class_FF 通配与当前设备 ID）……' -ForegroundColor Cyan
+                $drvRes = Install-BundledDeps -Root $Root -InstallDrivers -ExtraHardwareIds $extraHids
                 $driverInstalledThisRun = $true
                 if ($drvRes.Ok) {
-                    Write-Host '[通过] 内置 USB 驱动安装完成！请拔掉手机数据线再重新插上。' -ForegroundColor Green
+                    Write-Host '[通过] 通用 ADB 驱动安装命令已执行完毕！' -ForegroundColor Green
+                    Write-Host '       请拔掉手机数据线重新插上（或在手机下拉通知栏切换一次「传输文件 / 仅充电」）。' -ForegroundColor Yellow
                 } else {
-                    Write-Host '[提示] 自动安装驱动未完成（可能取消了管理员授权），你也可以右键以管理员身份运行 gnirehtet.bat。' -ForegroundColor Yellow
+                    Write-Host '[提示] 自动安装驱动未完成（可能取消了管理员授权），请右键以管理员身份运行 gnirehtet.bat。' -ForegroundColor Yellow
+                }
+                if ($drvRes.Log) {
+                    $summary = @($drvRes.Log -split "`r?`n" | Where-Object { $_ -match 'PNP_UNIVERSAL_EXIT|UNI_DRV_EXIT|发布名称|Published|已添加|Added|失败|Failed|错误' } | Select-Object -First 6)
+                    if ($summary.Count -gt 0) {
+                        Write-Host '  驱动安装反馈：' -ForegroundColor DarkGray
+                        foreach ($sl in $summary) { Write-Host ('    ' + $sl.Trim()) -ForegroundColor DarkGray }
+                    }
                 }
             }
         }
 
         Write-Host ''
         $retry = ''
-        try { $retry = Read-Host '请插好手机并打开 USB 调试后按回车重试（输入 q 退出）' } catch { return $null }
+        try { $retry = Read-Host '请拔插数据线并确认手机弹窗点「允许」后按回车重试（输入 d 重装驱动，q 退出）' } catch { return $null }
         if ($null -eq $retry -or $retry.Trim() -match '^(q|quit|exit|n)$') {
             return $null
+        }
+        if ($retry.Trim() -match '^(d|drv|driver)$') {
+            $driverInstalledThisRun = $false
         }
     }
 }
@@ -346,8 +364,10 @@ if ($missingTools.Count -gt 0) {
 
 # 快捷子命令：install-deps / verify / preflight
 if ($Action -eq 'install-deps') {
-    Write-Host '[*] 正在安装全部内置依赖（微软 VC++ 运行库 + Android USB 驱动）……' -ForegroundColor Cyan
-    $r = Install-BundledDeps -Root $Root -InstallRuntime -InstallDrivers
+    Write-Host '[*] 正在安装全部内置依赖（微软 VC++ 运行库 + 通用 Android ADB 驱动）……' -ForegroundColor Cyan
+    $brokenNow = @(Get-BrokenAndroidUsbDevices)
+    $extraHids = @($brokenNow | Where-Object { $_.HardwareId } | ForEach-Object { $_.HardwareId })
+    $r = Install-BundledDeps -Root $Root -InstallRuntime -InstallDrivers -ExtraHardwareIds $extraHids
     if ($r.Ok) {
         Write-Host '[通过] 内置依赖安装完成。' -ForegroundColor Green
         if ($r.RebootSuggested) {
