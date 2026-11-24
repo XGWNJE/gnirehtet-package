@@ -33,6 +33,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Windows 7 / 旧版 .NET 默认仅开启 TLS 1.0，强开 TLS 1.2（3072）避免连 GitHub/Google HTTPS 失败
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072 } catch { }
+
 # 绿色版：不带参数时以包自身位置为准，整个目录可以随意搬动
 if (-not $Root) { $Root = Split-Path -Parent $PSScriptRoot }
 
@@ -59,10 +62,29 @@ function Fail {
     exit 2
 }
 
+function Get-OsDescription {
+    $rt = 'System.Runtime.InteropServices.RuntimeInformation' -as [type]
+    if ($rt) {
+        try { return ([string]$rt::OSDescription).Trim() } catch { }
+    }
+    return [Environment]::OSVersion.VersionString
+}
+
 function Get-Sha256 {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
-    (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    if (Get-Command Get-FileHash -ErrorAction SilentlyContinue) {
+        return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $bytes = $sha.ComputeHash($stream)
+        return ([BitConverter]::ToString($bytes) -replace '-', '').ToLowerInvariant()
+    } finally {
+        $stream.Dispose()
+        $sha.Dispose()
+    }
 }
 
 function Assert-GoogleSignature {
@@ -114,8 +136,20 @@ function Get-RemoteFile {
     if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force }
 
     Write-Info "下载：$Url"
-    & curl.exe -fL --retry 3 --retry-delay 2 --connect-timeout 30 --max-time 900 -o $tmp $Url
-    if ($LASTEXITCODE -ne 0) { Fail "下载失败（curl 退出码 $LASTEXITCODE）：$Url" }
+    if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
+        & curl.exe -fL --retry 3 --retry-delay 2 --connect-timeout 30 --max-time 900 -o $tmp $Url
+        if ($LASTEXITCODE -ne 0) { Fail "下载失败（curl 退出码 $LASTEXITCODE）：$Url" }
+    } else {
+        # Windows 7 默认没有 curl.exe，回退到 .NET WebClient（已开启 TLS 1.2）
+        $wc = New-Object System.Net.WebClient
+        try {
+            $wc.DownloadFile($Url, $tmp)
+        } catch {
+            Fail "下载失败（WebClient）：$Url（$($_.Exception.Message)）"
+        } finally {
+            $wc.Dispose()
+        }
+    }
     if (-not (Test-Path -LiteralPath $tmp)) { Fail "下载未产生文件：$Url" }
 
     $len = (Get-Item -LiteralPath $tmp).Length
@@ -146,7 +180,12 @@ function Expand-ToStage {
 
     Write-Info "解压：$(Split-Path -Leaf $Zip)"
     try {
-        Expand-Archive -LiteralPath $Zip -DestinationPath $Dest -Force -ErrorAction Stop
+        if (Get-Command Expand-Archive -ErrorAction SilentlyContinue) {
+            Expand-Archive -LiteralPath $Zip -DestinationPath $Dest -Force -ErrorAction Stop
+        } else {
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            [System.IO.Compression.ZipFile]::ExtractToDirectory($Zip, $Dest)
+        }
     } catch {
         Fail "解压失败：$Zip（$($_.Exception.Message)）"
     }
@@ -219,7 +258,7 @@ if ($extras) {
 # ---------------------------------------------------------------- manifest
 $manifest = [ordered]@{
     createdAt        = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz')
-    os               = [System.Runtime.InteropServices.RuntimeInformation]::OSDescription
+    os               = Get-OsDescription
     gnirehtetVersion = $GnirehtetVersion
     archives         = @(
         [ordered]@{
@@ -246,7 +285,8 @@ $manifest = [ordered]@{
     )
 }
 
-$manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $ManifestPath -Encoding utf8
+$jsonText = $manifest | ConvertTo-Json -Depth 6
+[System.IO.File]::WriteAllText($ManifestPath, $jsonText, (New-Object System.Text.UTF8Encoding($false)))
 Write-Ok "已生成清单：$ManifestPath"
 
 # ---------------------------------------------------------------- 清理暂存

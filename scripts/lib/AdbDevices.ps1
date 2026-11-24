@@ -74,7 +74,7 @@ function Initialize-AdbServer {
         $parsed
     }
 
-    $listening = @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)
+    $listening = @(Get-TcpPortConnections -Port $port -ListenOnly)
     if ($listening.Count -gt 0) {
         $owner = Get-CimProcess -ProcessId $listening[0].OwningProcess
         # 安全防线：端口占用者不是 adb.exe 时，绝不调用其可执行文件，也不强行 kill-server
@@ -96,7 +96,7 @@ function Initialize-AdbServer {
         Write-Host ('  正在重启 adb 服务（端口 {0} 上的服务来源或版本不一致）……' -f $port) -ForegroundColor DarkGray
         Invoke-ProcessCapture -FilePath $AdbExe -Arguments @('kill-server') -TimeoutSeconds 15 | Out-Null
         for ($i = 0; $i -lt 25; $i++) {
-            if (-not (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)) { break }
+            if (@(Get-TcpPortConnections -Port $port -ListenOnly).Count -eq 0) { break }
             Start-Sleep -Milliseconds 200
         }
     }
@@ -105,7 +105,7 @@ function Initialize-AdbServer {
     Start-Process -FilePath $AdbExe -ArgumentList 'start-server' -WindowStyle Hidden | Out-Null
 
     for ($i = 0; $i -lt ($TimeoutSeconds * 5); $i++) {
-        if (@(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue).Count -gt 0) {
+        if (@(Get-TcpPortConnections -Port $port -ListenOnly).Count -gt 0) {
             return $true
         }
         Start-Sleep -Milliseconds 200

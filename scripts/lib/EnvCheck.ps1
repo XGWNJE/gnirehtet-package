@@ -64,20 +64,125 @@ function New-Finding {
     }
 }
 
+function Get-OsDescription {
+    $rt = 'System.Runtime.InteropServices.RuntimeInformation' -as [type]
+    if ($rt) {
+        try { return ([string]$rt::OSDescription).Trim() } catch { }
+    }
+    return [Environment]::OSVersion.VersionString
+}
+
+function Get-FileSha256 {
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    if (Get-Command Get-FileHash -ErrorAction SilentlyContinue) {
+        return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $bytes = $sha.ComputeHash($stream)
+        return ([BitConverter]::ToString($bytes) -replace '-', '').ToLowerInvariant()
+    } finally {
+        $stream.Dispose()
+        $sha.Dispose()
+    }
+}
+
 function Get-CimProcess {
     param([int]$ProcessId)
-    try {
-        Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction Stop
-    } catch {
-        $null
+    if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+        try {
+            return (Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction Stop)
+        } catch { }
     }
+    if (Get-Command Get-WmiObject -ErrorAction SilentlyContinue) {
+        try {
+            $w = Get-WmiObject Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction Stop
+            if ($w) {
+                $cd = $null
+                if ($w.CreationDate) {
+                    try { $cd = [Management.ManagementDateTimeConverter]::ToDateTime($w.CreationDate) } catch { $cd = $w.CreationDate }
+                }
+                return [pscustomobject]@{
+                    ProcessId      = [int]$w.ProcessId
+                    Name           = $w.Name
+                    ExecutablePath = $w.ExecutablePath
+                    CommandLine    = $w.CommandLine
+                    CreationDate   = $cd
+                }
+            }
+        } catch { }
+    }
+    try {
+        $p = Get-Process -Id $ProcessId -ErrorAction Stop
+        $pPath = $null; $pStart = $null
+        try { $pPath = $p.Path } catch { }
+        try { $pStart = $p.StartTime } catch { }
+        return [pscustomobject]@{
+            ProcessId      = [int]$p.Id
+            Name           = if ($p.ProcessName -like '*.exe') { $p.ProcessName } else { "$($p.ProcessName).exe" }
+            ExecutablePath = $pPath
+            CommandLine    = $null
+            CreationDate   = $pStart
+        }
+    } catch {
+        return $null
+    }
+}
+
+function Get-TcpPortConnections {
+    param([int]$Port, [switch]$ListenOnly)
+    if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {
+        $query = @{ LocalPort = $Port }
+        if ($ListenOnly) { $query['State'] = 'Listen' }
+        try {
+            return @(Get-NetTCPConnection @query -ErrorAction Stop)
+        } catch {
+            # 无匹配连接时 cmdlet 会抛 No MSFT_NetTCPConnection objects found；区分无连接与 CIM 不可用
+            if ($_.Exception.Message -match 'No MSFT_NetTCPConnection|找不到任何') {
+                return @()
+            }
+        }
+    }
+
+    # Windows 7 / CIM 受限兜底：解析 netstat -ano -p tcp
+    $results = New-Object System.Collections.Generic.List[object]
+    $netstatOut = @()
+    try { $netstatOut = @(& netstat.exe -ano -p tcp 2>$null) } catch { return @() }
+    foreach ($line in $netstatOut) {
+        if ($line -match '^\s*TCP\s+(\S+):(\d+)\s+(\S+):(\d+|\*)\s+(\S+)\s+(\d+)\s*$') {
+            $localAddr  = $Matches[1].Trim('[', ']')
+            $localPort  = [int]$Matches[2]
+            $remoteAddr = $Matches[3].Trim('[', ']')
+            $remotePort = if ($Matches[4] -eq '*') { 0 } else { [int]$Matches[4] }
+            $rawState   = $Matches[5].ToUpperInvariant()
+            $owningPid  = [int]$Matches[6]
+            if ($localPort -ne $Port) { continue }
+            $state = switch ($rawState) {
+                'LISTENING'   { 'Listen' }
+                'ESTABLISHED' { 'Established' }
+                'TIME_WAIT'   { 'TimeWait' }
+                'CLOSE_WAIT'  { 'CloseWait' }
+                default       { $rawState }
+            }
+            if ($ListenOnly -and $state -ne 'Listen') { continue }
+            $results.Add([pscustomobject]@{
+                LocalAddress  = $localAddr
+                LocalPort     = $localPort
+                RemoteAddress = $remoteAddr
+                RemotePort    = $remotePort
+                State         = $state
+                OwningProcess = $owningPid
+            })
+        }
+    }
+    return $results.ToArray()
 }
 
 function Get-PortOwners {
     param([int]$Port, [switch]$ListenOnly)
-    $query = @{ LocalPort = $Port }
-    if ($ListenOnly) { $query['State'] = 'Listen' }
-    $conns = @(Get-NetTCPConnection @query -ErrorAction SilentlyContinue)
+    $conns = @(Get-TcpPortConnections -Port $Port -ListenOnly:$ListenOnly)
     foreach ($c in $conns) {
         $proc = Get-CimProcess -ProcessId $c.OwningProcess
         [pscustomobject]@{
@@ -94,28 +199,59 @@ function Get-PortOwners {
     }
 }
 
-function Get-AdbProcessList {
-    @(Get-CimInstance Win32_Process -Filter "Name='adb.exe'" -ErrorAction SilentlyContinue |
+function Get-ProcessListByName {
+    param([string]$ExeName)
+    if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+        try {
+            return @(Get-CimInstance Win32_Process -Filter "Name='$ExeName'" -ErrorAction Stop |
+                ForEach-Object {
+                    [pscustomobject]@{
+                        PID          = [int]$_.ProcessId
+                        Path         = $_.ExecutablePath
+                        CommandLine  = $_.CommandLine
+                        CreationDate = $_.CreationDate
+                    }
+                })
+        } catch { }
+    }
+    if (Get-Command Get-WmiObject -ErrorAction SilentlyContinue) {
+        try {
+            return @(Get-WmiObject Win32_Process -Filter "Name='$ExeName'" -ErrorAction Stop |
+                ForEach-Object {
+                    $cd = $null
+                    if ($_.CreationDate) {
+                        try { $cd = [Management.ManagementDateTimeConverter]::ToDateTime($_.CreationDate) } catch { $cd = $_.CreationDate }
+                    }
+                    [pscustomobject]@{
+                        PID          = [int]$_.ProcessId
+                        Path         = $_.ExecutablePath
+                        CommandLine  = $_.CommandLine
+                        CreationDate = $cd
+                    }
+                })
+        } catch { }
+    }
+    $baseName = [IO.Path]::GetFileNameWithoutExtension($ExeName)
+    return @(Get-Process -Name $baseName -ErrorAction SilentlyContinue |
         ForEach-Object {
+            $pPath = $null; $pStart = $null
+            try { $pPath = $_.Path } catch { }
+            try { $pStart = $_.StartTime } catch { }
             [pscustomobject]@{
-                PID          = [int]$_.ProcessId
-                Path         = $_.ExecutablePath
-                CommandLine  = $_.CommandLine
-                CreationDate = $_.CreationDate
+                PID          = [int]$_.Id
+                Path         = $pPath
+                CommandLine  = $null
+                CreationDate = $pStart
             }
         })
 }
 
+function Get-AdbProcessList {
+    Get-ProcessListByName -ExeName 'adb.exe'
+}
+
 function Get-GnirehtetProcessList {
-    @(Get-CimInstance Win32_Process -Filter "Name='gnirehtet.exe'" -ErrorAction SilentlyContinue |
-        ForEach-Object {
-            [pscustomobject]@{
-                PID          = [int]$_.ProcessId
-                Path         = $_.ExecutablePath
-                CommandLine  = $_.CommandLine
-                CreationDate = $_.CreationDate
-            }
-        })
+    Get-ProcessListByName -ExeName 'gnirehtet.exe'
 }
 
 function Invoke-ProcessCapture {

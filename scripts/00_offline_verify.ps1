@@ -43,6 +43,40 @@ $ToolsDir  = Join-Path $Root 'tools\gnirehtet'
 $LogsDir   = Join-Path $Root 'logs'
 $ScriptsDir = Join-Path $Root 'scripts'
 $ManifestPath = Join-Path $Root 'manifest.json'
+$EnvLibPath = Join-Path $ScriptsDir 'lib\EnvCheck.ps1'
+$script:EnvLibLoaded = $false
+if (Test-Path -LiteralPath $EnvLibPath) {
+    try {
+        . $EnvLibPath
+        $script:EnvLibLoaded = $true
+    } catch { }
+}
+
+if (-not (Get-Command Get-OsDescription -ErrorAction SilentlyContinue)) {
+    function Get-OsDescription {
+        $rt = 'System.Runtime.InteropServices.RuntimeInformation' -as [type]
+        if ($rt) { try { return ([string]$rt::OSDescription).Trim() } catch { } }
+        return [Environment]::OSVersion.VersionString
+    }
+}
+if (-not (Get-Command Get-FileSha256 -ErrorAction SilentlyContinue)) {
+    function Get-FileSha256 {
+        param([string]$Path)
+        if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+        if (Get-Command Get-FileHash -ErrorAction SilentlyContinue) {
+            return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        $stream = [System.IO.File]::OpenRead($Path)
+        try {
+            $bytes = $sha.ComputeHash($stream)
+            return ([BitConverter]::ToString($bytes) -replace '-', '').ToLowerInvariant()
+        } finally {
+            $stream.Dispose()
+            $sha.Dispose()
+        }
+    }
+}
 
 if (-not $LogFile) {
     $LogFile = Join-Path $LogsDir ('offline-verify-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.txt')
@@ -130,7 +164,7 @@ try {
     Add-Line ('包根目录   : ' + $Root)
     Add-Line ('日志文件   : ' + $LogFile)
     Add-Line ('PowerShell : ' + $PSVersionTable.PSVersion.ToString())
-    Add-Line ('操作系统   : ' + [System.Runtime.InteropServices.RuntimeInformation]::OSDescription.Trim())
+    Add-Line ('操作系统   : ' + (Get-OsDescription))
     Add-Line ('进程位数   : ' + $(if ([Environment]::Is64BitProcess) { '64 位' } else { '32 位' }))
     Add-Line '模式       : 只读验收（不连手机、不启动隧道、不改防火墙、不改路由）'
 
@@ -183,7 +217,7 @@ try {
             Add-Check -Name "文件过小 $($r.Name)" -Status FAIL -Detail "$($item.Length) 字节，$($r.Desc)" -Blocking
             continue
         }
-        $hash = (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant()
+        $hash = Get-FileSha256 -Path $p
         $fileHashes[$r.Name] = $hash
         Add-Check -Name $r.Name -Status PASS -Detail ('{0} 字节  {1}  {2}' -f $item.Length, $hash.Substring(0, 16), $r.Desc)
     }
@@ -226,7 +260,7 @@ try {
             $untrackedBins = @()
             foreach ($o in @($others)) {
                 if ($manifestMap.ContainsKey($o.Name)) {
-                    $oHash = (Get-FileHash -LiteralPath $o.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                    $oHash = Get-FileSha256 -Path $o.FullName
                     if ($oHash -ne $manifestMap[$o.Name]) {
                         $mismatch += $o.Name
                     }
@@ -273,8 +307,12 @@ try {
 
     # ------------------------------------------------------------ 4 端口 31416
     Add-Section '4. TCP 31416 占用情况'
-    # 无匹配连接时 cmdlet 会写非终止错误，用 SilentlyContinue 抑制
-    $port31416 = @(Get-NetTCPConnection -LocalPort 31416 -ErrorAction SilentlyContinue)
+    # 兼容 Win7（无 Get-NetTCPConnection 时自动降级 netstat）
+    $port31416 = if (Get-Command Get-TcpPortConnections -ErrorAction SilentlyContinue) {
+        @(Get-TcpPortConnections -Port 31416)
+    } else {
+        @(Get-NetTCPConnection -LocalPort 31416 -ErrorAction SilentlyContinue)
+    }
 
     if ($port31416.Count -eq 0) {
         Add-Check -Name '端口 31416' -Status PASS -Detail '当前无监听/连接，可分配'
@@ -302,21 +340,44 @@ try {
         Add-Check -Name '防火墙规则扫描' -Status INFO -Detail '已按参数跳过'
     } else {
         $fwOk = $true
+        $allCount = 0
         $nameRules = @()
         $portRules = @()
         try {
-            $allRules = @(Get-NetFirewallRule -ErrorAction Stop)
-            $nameRules = @($allRules | Where-Object { $_.DisplayName -like '*gnirehtet*' -or $_.Name -like '*gnirehtet*' })
+            if (Get-Command Get-NetFirewallRule -ErrorAction SilentlyContinue) {
+                $allRules = @(Get-NetFirewallRule -ErrorAction Stop)
+                $allCount = $allRules.Count
+                $nameRules = @($allRules | Where-Object { $_.DisplayName -like '*gnirehtet*' -or $_.Name -like '*gnirehtet*' })
 
-            $portFilters = @(Get-NetFirewallPortFilter -ErrorAction Stop)
-            $idsFor31416 = New-Object System.Collections.Generic.HashSet[string]
-            foreach ($pf in $portFilters) {
-                foreach ($p in @($pf.LocalPort)) {
-                    if ([string]$p -eq '31416') { [void]$idsFor31416.Add($pf.InstanceID) }
+                $portFilters = @(Get-NetFirewallPortFilter -ErrorAction Stop)
+                $idsFor31416 = New-Object System.Collections.Generic.HashSet[string]
+                foreach ($pf in $portFilters) {
+                    foreach ($p in @($pf.LocalPort)) {
+                        if ([string]$p -eq '31416') { [void]$idsFor31416.Add($pf.InstanceID) }
+                    }
                 }
-            }
-            if ($idsFor31416.Count -gt 0) {
-                $portRules = @($allRules | Where-Object { $idsFor31416.Contains($_.InstanceID) })
+                if ($idsFor31416.Count -gt 0) {
+                    $portRules = @($allRules | Where-Object { $idsFor31416.Contains($_.InstanceID) })
+                }
+            } else {
+                # Windows 7 兜底：使用 COM HNetCfg.FwPolicy2 只读枚举防火墙规则
+                $fwPolicy = New-Object -ComObject HNetCfg.FwPolicy2
+                $nList = New-Object System.Collections.Generic.List[object]
+                $pList = New-Object System.Collections.Generic.List[object]
+                foreach ($r in $fwPolicy.Rules) {
+                    $allCount++
+                    $obj = [pscustomobject]@{
+                        DisplayName = [string]$r.Name
+                        Enabled     = [bool]$r.Enabled
+                        Direction   = if ($r.Direction -eq 1) { 'Inbound' } else { 'Outbound' }
+                        Action      = if ($r.Action -eq 1) { 'Allow' } else { 'Block' }
+                        Profile     = [string]$r.Profiles
+                    }
+                    if ($obj.DisplayName -like '*gnirehtet*') { $nList.Add($obj) }
+                    if ($r.LocalPorts -and (([string]$r.LocalPorts -split ',') -contains '31416')) { $pList.Add($obj) }
+                }
+                $nameRules = $nList.ToArray()
+                $portRules = $pList.ToArray()
             }
         } catch {
             $fwOk = $false
@@ -324,7 +385,7 @@ try {
         }
 
         if ($fwOk) {
-            Add-Line ('规则总数      : ' + $allRules.Count)
+            Add-Line ('规则总数      : ' + $allCount)
             Add-Line ('名称含 gnirehtet : ' + $nameRules.Count + ' 条')
             foreach ($r in $nameRules) {
                 Add-Line ('  - {0} | 启用={1} 方向={2} 动作={3}' -f $r.DisplayName, $r.Enabled, $r.Direction, $r.Action)
@@ -371,10 +432,9 @@ try {
     # ------------------------------------------------------------ 7 环境预检
     Add-Section '7. 环境预检（是否与其他服务互相干扰）'
     $envPre = $null
-    $libPath = Join-Path $ScriptsDir 'lib\EnvCheck.ps1'
-    if (Test-Path -LiteralPath $libPath) {
+    if ($script:EnvLibLoaded -or (Test-Path -LiteralPath $EnvLibPath)) {
         try {
-            . $libPath
+            if (-not $script:EnvLibLoaded) { . $EnvLibPath }
             $envPre = Invoke-EnvPreflight -Root $Root
             foreach ($sev in @('BLOCKER', 'WARN', 'INFO')) {
                 foreach ($f in $envPre.Findings | Where-Object Severity -eq $sev) {
@@ -388,7 +448,7 @@ try {
             Add-Check -Name '环境预检' -Status WARN -Detail ('执行失败：' + $_.Exception.Message)
         }
     } else {
-        Add-Check -Name '环境预检库缺失' -Status WARN -Detail "缺少 $libPath，跳过干扰检查"
+        Add-Check -Name '环境预检库缺失' -Status WARN -Detail "缺少 $EnvLibPath，跳过干扰检查"
     }
 
     $drive = (Get-Item -LiteralPath $Root).PSDrive

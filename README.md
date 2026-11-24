@@ -3,6 +3,7 @@
 离线准备产物，用于「手机通过 USB 借电脑上网（反向 tethering）」。
 
 > 实机前请先运行 `scripts\00_offline_verify.ps1` 与 `scripts\10_env_preflight.ps1` 确认包完整且端口无冲突。
+> 完整图文/命令行教程（含 **Windows 7 专项准备** 与 **部分 App 报无网络 / 后台断连排错**）请看 👉 [docs/GUIDE.md](docs/GUIDE.md)。
 
 ## 目录结构
 
@@ -17,6 +18,7 @@ gnirehtet-package\            ← 绿色包，整个文件夹放哪都能跑
 │  ├─ lib\EnvFix.ps1         处置（识别干扰目标、按 PID 关闭、复查）
 │  └─ lib\AdbDevices.ps1     设备列表、状态翻译、多设备选择、adb 服务预启动
 ├─ tools\gnirehtet\          实机工作目录，所有文件同目录
+├─ docs\GUIDE.md             详细操作教程（含 Win7 准备与实测排错手册）
 ├─ download\                 原始压缩包缓存（可删）
 ├─ logs\                     构建 / 验收 / 体检日志
 └─ manifest.json             版本、大小、SHA256 清单
@@ -29,9 +31,11 @@ gnirehtet-package\            ← 绿色包，整个文件夹放哪都能跑
 - **产物都在包内**：日志写 `logs\`，下载缓存在 `download\`，清单是 `manifest.json`。
 - **删掉即卸载**：把文件夹删了就没有残留（除非你自己用 `-Fix` 关过别人的服务，那本来就该由你决定）。
 
-唯一的外部依赖：PowerShell 7（`pwsh`）。如果只有系统自带的 5.1，中文提示可能变成乱码，功能仍可用。
+兼容 **PowerShell 7（`pwsh`）** 与 **Windows 自带 PowerShell 5.1（含 Windows 7 SP1 + WMF 5.1）**：全部 `.ps1` 脚本采用 UTF-8 with BOM 编码，并在缺少 Win10/11 新命令时自动降级到 `netstat` / `WMI` / 防火墙 COM / `.NET WebClient`（TLS 1.2）。
 
 ## 推荐流程
+
+> Windows 7 或未装 `pwsh` 时，把下面命令中的 `pwsh -NoProfile -File` 替换为 `powershell -NoProfile -ExecutionPolicy Bypass -File` 即可。
 
 ```powershell
 cd <包目录>                                                  # 例如 D:\tools\gnirehtet-package
