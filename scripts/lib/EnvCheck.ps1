@@ -1,4 +1,4 @@
-<#
+﻿<#
     共享环境检测库（只读）。
 
     被以下脚本点引用：
@@ -19,6 +19,16 @@ function Resolve-PackageRoot {
     return (Get-Location).Path
 }
 
+function Get-AdbServerPort {
+    if ($env:ANDROID_ADB_SERVER_PORT) {
+        $parsed = 0
+        if ([int]::TryParse($env:ANDROID_ADB_SERVER_PORT.Trim(), [ref]$parsed) -and $parsed -ge 1 -and $parsed -le 65535) {
+            return $parsed
+        }
+    }
+    return 5037
+}
+
 function Get-GnirehtetPaths {
     param([string]$Root = '')
     $Root = Resolve-PackageRoot -Root $Root
@@ -27,6 +37,7 @@ function Get-GnirehtetPaths {
         ToolsDir    = Join-Path $Root 'tools\gnirehtet'
         AdbExe      = Join-Path $Root 'tools\gnirehtet\adb.exe'
         GnExe       = Join-Path $Root 'tools\gnirehtet\gnirehtet.exe'
+        GnApk       = Join-Path $Root 'tools\gnirehtet\gnirehtet.apk'
         LogsDir     = Join-Path $Root 'logs'
         DownloadDir = Join-Path $Root 'download'
     }
@@ -70,14 +81,15 @@ function Get-PortOwners {
     foreach ($c in $conns) {
         $proc = Get-CimProcess -ProcessId $c.OwningProcess
         [pscustomobject]@{
-            Port        = $Port
-            Local       = "$($c.LocalAddress):$($c.LocalPort)"
-            Remote      = "$($c.RemoteAddress):$($c.RemotePort)"
-            State       = [string]$c.State
-            PID         = [int]$c.OwningProcess
-            Name        = if ($proc) { $proc.Name } else { '' }
-            Path        = if ($proc) { $proc.ExecutablePath } else { $null }
-            CommandLine = if ($proc) { $proc.CommandLine } else { $null }
+            Port         = $Port
+            Local        = "$($c.LocalAddress):$($c.LocalPort)"
+            Remote       = "$($c.RemoteAddress):$($c.RemotePort)"
+            State        = [string]$c.State
+            PID          = [int]$c.OwningProcess
+            Name         = if ($proc) { $proc.Name } else { '' }
+            Path         = if ($proc) { $proc.ExecutablePath } else { $null }
+            CommandLine  = if ($proc) { $proc.CommandLine } else { $null }
+            CreationDate = if ($proc) { $proc.CreationDate } else { $null }
         }
     }
 }
@@ -86,9 +98,10 @@ function Get-AdbProcessList {
     @(Get-CimInstance Win32_Process -Filter "Name='adb.exe'" -ErrorAction SilentlyContinue |
         ForEach-Object {
             [pscustomobject]@{
-                PID         = [int]$_.ProcessId
-                Path        = $_.ExecutablePath
-                CommandLine = $_.CommandLine
+                PID          = [int]$_.ProcessId
+                Path         = $_.ExecutablePath
+                CommandLine  = $_.CommandLine
+                CreationDate = $_.CreationDate
             }
         })
 }
@@ -97,9 +110,10 @@ function Get-GnirehtetProcessList {
     @(Get-CimInstance Win32_Process -Filter "Name='gnirehtet.exe'" -ErrorAction SilentlyContinue |
         ForEach-Object {
             [pscustomobject]@{
-                PID         = [int]$_.ProcessId
-                Path        = $_.ExecutablePath
-                CommandLine = $_.CommandLine
+                PID          = [int]$_.ProcessId
+                Path         = $_.ExecutablePath
+                CommandLine  = $_.CommandLine
+                CreationDate = $_.CreationDate
             }
         })
 }
@@ -204,14 +218,29 @@ function Invoke-EnvPreflight {
             -Evidence (@($pathAdb.Source) + @($pathAdbAll | Select-Object -Skip 1 | ForEach-Object { '其次：' + $_.Source }))))
     }
 
-    # ---------------------------------------------------- 2) 5037 adb server
-    $server = @(Get-PortOwners -Port 5037 -ListenOnly)
+    # ---------------------------------------------------- 2) adb server 端口（默认 5037，遵循 ANDROID_ADB_SERVER_PORT）
+    $adbPort = Get-AdbServerPort
+    $server = @(Get-PortOwners -Port $adbPort -ListenOnly)
     if ($server.Count -eq 0) {
         $findings.Add((New-Finding -Severity INFO -Id 'adb-server-none' `
-            -Title '5037 上没有 adb server 在跑' `
+            -Title "$adbPort 上没有 adb server 在跑" `
             -Detail '当前环境是干净的；实机时本包 adb 会自行拉起 server。'))
     } else {
+        $seenAdbPids = New-Object System.Collections.Generic.HashSet[int]
         foreach ($s in $server) {
+            if ($s.PID -and -not $seenAdbPids.Add($s.PID)) { continue }
+
+            # 安全防线：只对确认是 adb.exe 的进程查询版本，绝不执行未知外部程序
+            if ($s.Name -ine 'adb.exe') {
+                $procLabel = if ($s.Name) { $s.Name } else { '未知进程' }
+                $findings.Add((New-Finding -Severity BLOCKER -Id 'adb-port-non-adb' `
+                    -Title "$adbPort 端口被非 adb 程序占用" `
+                    -Detail "占用者：$procLabel（PID $($s.PID)）。不是 adb.exe，脚本不会调用它；adb 无法在此端口启动。" `
+                    -Fix '确认该服务可停后，运行 10_env_preflight.ps1 -Fix 交互关闭，或通过 ANDROID_ADB_SERVER_PORT 改用其它端口。' `
+                    -Evidence @("$($s.Local)  PID $($s.PID)  $($s.Path)")))
+                continue
+            }
+
             $isOwn = Test-SamePath $s.Path $p.AdbExe
             $srvVer = Get-AdbVersionInfo -Exe $s.Path
             $verNote = if ($srvVer.Ok -and $pkgAdbVersion.Ok) {
@@ -225,13 +254,13 @@ function Invoke-EnvPreflight {
             if ($isOwn) {
                 $findings.Add((New-Finding -Severity WARN -Id 'adb-server-own' `
                     -Title '本包 adb server 残留' `
-                    -Detail "PID $($s.PID) 由本包 adb 启动，属于可安全回收的自身残留。$verNote" `
+                    -Detail "PID $($s.PID) 由本包 adb 启动（端口 $adbPort），属于可安全回收的自身残留。$verNote" `
                     -Fix '运行 10_env_preflight.ps1 -Apply 回收（只对本包 server 执行 kill-server）。' `
                     -Evidence @("$($s.Local)  PID $($s.PID)  $($s.Path)") -AutoFix))
             } else {
                 $sameVersion = ($srvVer.Ok -and $pkgAdbVersion.Ok -and $srvVer.Build -eq $pkgAdbVersion.Build)
                 $findings.Add((New-Finding -Severity $(if ($sameVersion) { 'WARN' } else { 'BLOCKER' }) -Id 'adb-server-foreign' `
-                    -Title $(if ($sameVersion) { '5037 由其他工具启动，但版本一致' } else { '5037 被其他 adb server 占用' }) `
+                    -Title $(if ($sameVersion) { "$adbPort 由其他工具启动，但版本一致" } else { "$adbPort 被其他 adb server 占用" }) `
                     -Detail "这是别的工具链（不是本包）启动的 server。$verNote$(if ($sameVersion) { ' 版本一致，可以直接共用，不会互相重启。' } else { ' 重启会打断对方正在进行的调试或安装。' })" `
                     -Fix $(if ($sameVersion) {
                             '可以直接用；若想彻底隔开，可关闭对方服务后重跑体检。'
@@ -249,8 +278,10 @@ function Invoke-EnvPreflight {
         $findings.Add((New-Finding -Severity INFO -Id 'port-31416-free' `
             -Title '31416 空闲' -Detail 'gnirehtet relay 默认端口可分配。'))
     } else {
+        $seen31416Pids = New-Object System.Collections.Generic.HashSet[int]
         foreach ($s in $listen31416) {
-            $isOwn = ($s.Name -eq 'gnirehtet.exe')
+            if ($s.PID -and -not $seen31416Pids.Add($s.PID)) { continue }
+            $isOwn = ($s.Name -ieq 'gnirehtet.exe')
             $findings.Add((New-Finding -Severity $(if ($isOwn) { 'WARN' } else { 'BLOCKER' }) -Id 'port-31416-busy' `
                 -Title '31416 已被占用' `
                 -Detail "占用者：$($s.Name)（PID $($s.PID)）。$($(if ($isOwn) { '看起来是本包 relay 残留。' } else { '不是 gnirehtet，启动 relay 会失败。' }))" `
@@ -279,6 +310,20 @@ function Invoke-EnvPreflight {
     }
 
     # ---------------------------------------------------- 5) 环境变量干扰
+    if ($env:ANDROID_ADB_SERVER_PORT) {
+        $parsedPort = 0
+        $validPort = [int]::TryParse($env:ANDROID_ADB_SERVER_PORT.Trim(), [ref]$parsedPort) -and $parsedPort -ge 1 -and $parsedPort -le 65535
+        if ($validPort) {
+            $findings.Add((New-Finding -Severity INFO -Id 'env-adb-port' `
+                -Title "已设置 ANDROID_ADB_SERVER_PORT = $parsedPort" `
+                -Detail "本次体检和后续 adb 命令都会使用端口 $parsedPort（而非默认 5037）。"))
+        } else {
+            $findings.Add((New-Finding -Severity WARN -Id 'env-adb-port-invalid' `
+                -Title "ANDROID_ADB_SERVER_PORT 无效：$($env:ANDROID_ADB_SERVER_PORT)" `
+                -Detail '端口值不在 1-65535 范围内，脚本已回退检查 5037，但 adb 自身可能报错。' `
+                -Fix '清掉该环境变量，或改为合法端口号。'))
+        }
+    }
     if ($env:ANDROID_SERIAL) {
         $findings.Add((New-Finding -Severity WARN -Id 'env-android-serial' `
             -Title "已设置 ANDROID_SERIAL = $($env:ANDROID_SERIAL)" `

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     gnirehtet 统一入口：先过环境闸门，再只在该问的地方问你。
 
@@ -55,8 +55,11 @@ $here = Split-Path -Parent $PSCommandPath
 
 $p = Get-GnirehtetPaths -Root $Root
 
-if (-not (Test-Path -LiteralPath $p.GnExe)) {
-    Write-Host "[阻断] 找不到 $($p.GnExe)" -ForegroundColor Red
+$missingTools = @($p.GnExe, $p.AdbExe, $p.GnApk | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) })
+if ($missingTools.Count -gt 0) {
+    foreach ($m in $missingTools) {
+        Write-Host "[阻断] 找不到 $m" -ForegroundColor Red
+    }
     Write-Host '       → 先运行 scripts\build_package.ps1' -ForegroundColor Yellow
     exit 2
 }
@@ -116,8 +119,13 @@ if ($Action -ne 'preflight') {
 function Invoke-Tool {
     param([string]$Exe, [string[]]$Arguments)
     Write-Host ('执行：' + $Exe + ' ' + ($Arguments -join ' ')) -ForegroundColor Cyan
-    & $Exe @Arguments
-    return $LASTEXITCODE
+    Push-Location -LiteralPath $p.ToolsDir
+    try {
+        & $Exe @Arguments
+        return $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
 }
 
 function Show-Devices {

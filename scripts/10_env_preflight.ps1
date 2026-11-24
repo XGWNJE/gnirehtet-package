@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     实机前的环境体检。默认只看不动；加 -Fix 可以交互式关掉干扰项。
 
@@ -123,7 +123,9 @@ try {
     Add-Out ('时间     : ' + (Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz'))
     Add-Out ('计算机名 : ' + $env:COMPUTERNAME + '　用户：' + $env:USERNAME)
     Add-Out ('包目录   : ' + $Root)
-    $mode = if ($Fix) {
+    $mode = if ($Fix -and $Apply) {
+        if ($DryRun) { '交互处理 · 演练（只说不做）+ 清理下载临时文件' } else { '交互处理 + 顺手清理本包残留' }
+    } elseif ($Fix) {
         if ($DryRun) { '交互处理 · 演练（只说不做）' } else { '交互处理（每次关东西前会再问一遍）' }
     } elseif ($Apply) { '顺手清理本包残留' } else { '只看不动' }
     Add-Out ('模式     : ' + $mode)
@@ -188,6 +190,18 @@ try {
             if ($stopped.Count) { Add-Out ('这次关掉了：' + ($stopped -join '；')) }
             if ($kept.Count)    { Add-Out ('保持没动：' + ($kept -join '；')) }
             if ($failed.Count)  { Add-Out ('没能关掉：' + ($failed -join '；')) }
+        }
+
+        if ($Apply -and (Test-Path -LiteralPath $p.DownloadDir)) {
+            $parts = @(Get-ChildItem -LiteralPath $p.DownloadDir -Filter '*.part' -File -ErrorAction SilentlyContinue)
+            foreach ($f in $parts) {
+                if ($DryRun) {
+                    Add-Out ('[演练] 本来会删除下载临时文件：' + $f.Name)
+                } else {
+                    Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
+                    Add-Out ('[执行] 删除下载临时文件：' + $f.Name)
+                }
+            }
         }
 
         Add-Out ''
@@ -266,9 +280,17 @@ catch {
     $exitCode = 2
 }
 finally {
-    [System.IO.File]::WriteAllLines($LogFile, $lines, (New-Object System.Text.UTF8Encoding($false)))
-    Write-Host ''
-    Write-Host ('日志已写入：' + $LogFile)
+    try {
+        $logParent = Split-Path -Parent $LogFile
+        if ($logParent -and -not (Test-Path -LiteralPath $logParent)) {
+            New-Item -ItemType Directory -Force -Path $logParent | Out-Null
+        }
+        [System.IO.File]::WriteAllLines($LogFile, $lines, (New-Object System.Text.UTF8Encoding($false)))
+        Write-Host ''
+        Write-Host ('日志已写入：' + $LogFile)
+    } catch {
+        Write-Warning ('写入日志失败：' + $_.Exception.Message)
+    }
 }
 
 exit $exitCode

@@ -1,4 +1,4 @@
-<#
+﻿<#
     设备识别库：读取 adb devices 列表、把状态翻译成人话、多设备时让人选。
 
     只在“已经通过环境闸门、准备操作手机”时使用——因为 `adb devices`
@@ -61,14 +61,27 @@ function Initialize-AdbServer {
 
     if (-not $AdbExe -or -not (Test-Path -LiteralPath $AdbExe)) { return $false }
 
-    $port = 5037
-    if ($env:ANDROID_ADB_SERVER_PORT) {
-        try { $port = [int]$env:ANDROID_ADB_SERVER_PORT } catch { $port = 5037 }
+    $port = if (Get-Command Get-AdbServerPort -ErrorAction SilentlyContinue) {
+        Get-AdbServerPort
+    } else {
+        $parsed = 5037
+        if ($env:ANDROID_ADB_SERVER_PORT) {
+            $tmp = 0
+            if ([int]::TryParse($env:ANDROID_ADB_SERVER_PORT.Trim(), [ref]$tmp) -and $tmp -ge 1 -and $tmp -le 65535) {
+                $parsed = $tmp
+            }
+        }
+        $parsed
     }
 
     $listening = @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)
     if ($listening.Count -gt 0) {
         $owner = Get-CimProcess -ProcessId $listening[0].OwningProcess
+        # 安全防线：端口占用者不是 adb.exe 时，绝不调用其可执行文件，也不强行 kill-server
+        if ($owner -and $owner.Name -ine 'adb.exe') {
+            Write-Host ("  [阻断] 端口 {0} 被非 adb 程序占用：{1}（PID {2}），跳过重启。" -f $port, $owner.Name, $listening[0].OwningProcess) -ForegroundColor Yellow
+            return $false
+        }
         $ownerPath = if ($owner) { $owner.ExecutablePath } else { $null }
         $versionOk = $true
         if ($ownerPath) {
@@ -142,13 +155,20 @@ function Select-AdbDevice {
 
     $answer = $Preset
     if (-not $answer) {
-        try { $answer = Read-Host '用哪台？输入编号，直接回车用第 1 台' } catch { $answer = $null }
+        try { $answer = Read-Host '用哪台？输入编号，直接回车用第 1 台' } catch { return $null }
     }
 
-    $pick = 1
-    if ($answer -and $answer.Trim() -match '^\d+$') {
-        $n = [int]$answer.Trim()
-        if ($n -ge 1 -and $n -le $usable.Count) { $pick = $n }
+    if ($null -eq $answer) { return $null }
+    $trimmed = $answer.Trim()
+    if ($trimmed -eq '') {
+        return $usable[0]
     }
-    $usable[$pick - 1]
+    if ($trimmed -match '^\d+$') {
+        $n = 0
+        if ([int]::TryParse($trimmed, [ref]$n) -and $n -ge 1 -and $n -le $usable.Count) {
+            return $usable[$n - 1]
+        }
+    }
+    Write-Host ("输入无效（{0}），已取消选择，未操作任何设备。" -f $trimmed) -ForegroundColor Yellow
+    return $null
 }

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     构建 gnirehtet 反向 USB 工具包（纯离线准备，不接触手机、不改路由、不改防火墙）。
 
@@ -36,9 +36,10 @@ $ErrorActionPreference = 'Stop'
 # 绿色版：不带参数时以包自身位置为准，整个目录可以随意搬动
 if (-not $Root) { $Root = Split-Path -Parent $PSScriptRoot }
 
-$GnirehtetVersion = '2.5.1'
-$GnirehtetUrl     = "https://github.com/Genymobile/gnirehtet/releases/download/v$GnirehtetVersion/gnirehtet-rust-win64-v$GnirehtetVersion.zip"
-$PlatformToolsUrl = 'https://dl.google.com/android/repository/platform-tools-latest-windows.zip'
+$GnirehtetVersion   = '2.5.1'
+$GnirehtetUrl       = "https://github.com/Genymobile/gnirehtet/releases/download/v$GnirehtetVersion/gnirehtet-rust-win64-v$GnirehtetVersion.zip"
+$GnirehtetZipSha256 = '7f5b1063e7895182aa60def1437e50363c3758144088dcd079037bb7c3c46a1c'
+$PlatformToolsUrl   = 'https://dl.google.com/android/repository/platform-tools-latest-windows.zip'
 
 $DownloadDir = Join-Path $Root 'download'
 $LogsDir     = Join-Path $Root 'logs'
@@ -58,20 +59,50 @@ function Fail {
     exit 2
 }
 
+function Get-Sha256 {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Assert-GoogleSignature {
+    param([string]$Path)
+    $sig = Get-AuthenticodeSignature -LiteralPath $Path
+    if ($sig.Status -ne 'Valid' -or -not $sig.SignerCertificate -or ($sig.SignerCertificate.Subject -notmatch 'CN=Google LLC')) {
+        $subject = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { '无签名' }
+        Fail "数字签名校验失败：$(Split-Path -Leaf $Path)（状态=$($sig.Status)，签发者=$subject）"
+    }
+    Write-Ok "数字签名通过（Google LLC）：$(Split-Path -Leaf $Path)"
+}
+
 function Get-RemoteFile {
     param(
         [string]$Url,
         [string]$OutFile,
-        [int64]$MinBytes = 1024
+        [int64]$MinBytes = 1024,
+        [string]$ExpectedSha256 = ''
     )
 
     if (-not $Force -and (Test-Path -LiteralPath $OutFile)) {
         $len = (Get-Item -LiteralPath $OutFile).Length
         if ($len -ge $MinBytes) {
-            Write-Ok "已存在，跳过下载：$(Split-Path -Leaf $OutFile)（$len 字节）"
-            return
+            if ($ExpectedSha256) {
+                $actual = Get-Sha256 -Path $OutFile
+                if ($actual -eq $ExpectedSha256.ToLowerInvariant()) {
+                    Write-Ok "已存在且 SHA256 校验通过，跳过下载：$(Split-Path -Leaf $OutFile)（$len 字节）"
+                    return
+                }
+                if ($SkipDownload) {
+                    Fail "本地缓存 SHA256 不匹配（指定了 -SkipDownload）：$(Split-Path -Leaf $OutFile)，实际=$actual，预期=$ExpectedSha256"
+                }
+                Write-Note "本地缓存 SHA256 不匹配，重新下载：$(Split-Path -Leaf $OutFile)"
+            } else {
+                Write-Ok "已存在，跳过下载：$(Split-Path -Leaf $OutFile)（$len 字节）"
+                return
+            }
+        } else {
+            Write-Note "已有文件不完整（$len 字节），重新下载：$(Split-Path -Leaf $OutFile)"
         }
-        Write-Note "已有文件不完整（$len 字节），重新下载：$(Split-Path -Leaf $OutFile)"
     }
 
     if ($SkipDownload) {
@@ -93,6 +124,15 @@ function Get-RemoteFile {
         Fail "下载内容过小（$len 字节），疑似失败页面：$Url"
     }
 
+    if ($ExpectedSha256) {
+        $actual = Get-Sha256 -Path $tmp
+        if ($actual -ne $ExpectedSha256.ToLowerInvariant()) {
+            Remove-Item -LiteralPath $tmp -Force
+            Fail "下载文件 SHA256 校验失败：$(Split-Path -Leaf $OutFile)，实际=$actual，预期=$ExpectedSha256"
+        }
+        Write-Ok "SHA256 校验通过：$(Split-Path -Leaf $OutFile)"
+    }
+
     Move-Item -LiteralPath $tmp -Destination $OutFile -Force
     Write-Ok "下载完成：$(Split-Path -Leaf $OutFile)（$len 字节）"
 }
@@ -112,18 +152,12 @@ function Expand-ToStage {
     }
 }
 
-function Get-Sha256 {
-    param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { return $null }
-    (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
-}
-
 # ---------------------------------------------------------------- 目录准备
 Write-Info "包根目录：$Root"
 New-Item -ItemType Directory -Force -Path $DownloadDir, $LogsDir, $ToolsDir | Out-Null
 
 # ---------------------------------------------------------------- 下载
-Get-RemoteFile -Url $GnirehtetUrl     -OutFile $GnirehtetZip -MinBytes 100000
+Get-RemoteFile -Url $GnirehtetUrl     -OutFile $GnirehtetZip -MinBytes 100000 -ExpectedSha256 $GnirehtetZipSha256
 Get-RemoteFile -Url $PlatformToolsUrl -OutFile $PlatformZip  -MinBytes 1000000
 
 # ---------------------------------------------------------------- gnirehtet
@@ -135,7 +169,9 @@ $gnExe = Get-ChildItem -LiteralPath $gStage -Recurse -File -Filter 'gnirehtet.ex
 if (-not $gnExe) { Fail 'gnirehtet 压缩包内未找到 gnirehtet.exe' }
 
 Write-Info "合入 gnirehtet 文件：$($gnExe.DirectoryName)"
-Copy-Item -Path (Join-Path $gnExe.DirectoryName '*') -Destination $ToolsDir -Recurse -Force
+Get-ChildItem -LiteralPath $gnExe.DirectoryName | ForEach-Object {
+    Copy-Item -LiteralPath $_.FullName -Destination $ToolsDir -Recurse -Force
+}
 
 # ---------------------------------------------------------------- platform-tools
 $pStage = Join-Path $StageDir 'platform-tools'
@@ -150,6 +186,7 @@ Write-Info "合入 adb 三件套：$adbDir"
 foreach ($name in @('adb.exe', 'AdbWinApi.dll', 'AdbWinUsbApi.dll')) {
     $src = Join-Path $adbDir $name
     if (-not (Test-Path -LiteralPath $src)) { Fail "platform-tools 内缺少 $name" }
+    Assert-GoogleSignature -Path $src
     Copy-Item -LiteralPath $src -Destination $ToolsDir -Force
     Write-Ok "复制 $name"
 }
@@ -182,7 +219,6 @@ if ($extras) {
 # ---------------------------------------------------------------- manifest
 $manifest = [ordered]@{
     createdAt        = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz')
-    machine          = $env:COMPUTERNAME
     os               = [System.Runtime.InteropServices.RuntimeInformation]::OSDescription
     gnirehtetVersion = $GnirehtetVersion
     archives         = @(

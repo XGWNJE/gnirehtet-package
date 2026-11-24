@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     gnirehtet 反向 USB 工具包离线验收（只读）。
 
@@ -205,18 +205,46 @@ try {
             $manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding utf8 | ConvertFrom-Json
             Add-Line ('构建清单   : ' + $ManifestPath)
             Add-Line ('构建时间   : ' + $manifest.createdAt)
-            Add-Line ('构建主机   : ' + $manifest.machine)
+            if ($manifest.machine) { Add-Line ('构建主机   : ' + $manifest.machine) }
             Add-Line ('gnirehtet  : v' + $manifest.gnirehtetVersion)
+
+            $manifestMap = @{}
+            foreach ($t in @($manifest.tools)) {
+                if ($t.file) { $manifestMap[$t.file] = [string]$t.sha256 }
+            }
+
             $mismatch = @()
-            foreach ($t in $manifest.tools) {
-                if ($fileHashes.ContainsKey($t.file) -and $fileHashes[$t.file] -ne $t.sha256) {
-                    $mismatch += $t.file
+            $missingInManifest = @()
+            foreach ($r in $required) {
+                if (-not $manifestMap.ContainsKey($r.Name)) {
+                    $missingInManifest += $r.Name
+                } elseif ($fileHashes.ContainsKey($r.Name) -and $fileHashes[$r.Name] -ne $manifestMap[$r.Name]) {
+                    $mismatch += $r.Name
                 }
             }
-            if ($mismatch.Count -eq 0) {
-                Add-Check -Name 'manifest 哈希一致性' -Status PASS -Detail '已校验文件与构建清单一致'
+
+            $untrackedBins = @()
+            foreach ($o in @($others)) {
+                if ($manifestMap.ContainsKey($o.Name)) {
+                    $oHash = (Get-FileHash -LiteralPath $o.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                    if ($oHash -ne $manifestMap[$o.Name]) {
+                        $mismatch += $o.Name
+                    }
+                } elseif ($o.Extension -in @('.exe', '.dll', '.cmd', '.bat', '.ps1')) {
+                    $untrackedBins += $o.Name
+                }
+            }
+
+            if ($mismatch.Count -eq 0 -and $missingInManifest.Count -eq 0) {
+                Add-Check -Name 'manifest 哈希一致性' -Status PASS -Detail '所有必需文件及已登记附带文件与构建清单一致'
             } else {
-                Add-Check -Name 'manifest 哈希不一致' -Status FAIL -Detail ($mismatch -join ', ') -Blocking
+                $parts = @()
+                if ($mismatch.Count -gt 0) { $parts += ('哈希不匹配：' + ($mismatch -join ', ')) }
+                if ($missingInManifest.Count -gt 0) { $parts += ('清单缺少条目：' + ($missingInManifest -join ', ')) }
+                Add-Check -Name 'manifest 哈希不一致' -Status FAIL -Detail ($parts -join '；') -Blocking
+            }
+            if ($untrackedBins.Count -gt 0) {
+                Add-Check -Name '同目录存在清单外可执行/库文件' -Status WARN -Detail ($untrackedBins -join ', ')
             }
         } catch {
             Add-Check -Name 'manifest.json 解析' -Status WARN -Detail $_.Exception.Message
@@ -414,10 +442,18 @@ catch {
     $script:ExitCode = 2
 }
 finally {
-    $utf8 = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllLines($LogFile, $script:Lines, $utf8)
-    Write-Host ''
-    Write-Host ('日志已写入：' + $LogFile)
+    try {
+        $logParent = Split-Path -Parent $LogFile
+        if ($logParent -and -not (Test-Path -LiteralPath $logParent)) {
+            New-Item -ItemType Directory -Force -Path $logParent | Out-Null
+        }
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllLines($LogFile, $script:Lines, $utf8)
+        Write-Host ''
+        Write-Host ('日志已写入：' + $LogFile)
+    } catch {
+        Write-Warning ('写入日志失败：' + $_.Exception.Message)
+    }
 }
 
 exit $(if ($null -ne $script:ExitCode) { $script:ExitCode } else { 2 })
