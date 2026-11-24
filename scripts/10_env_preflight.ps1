@@ -86,7 +86,14 @@ function Write-Result {
 
 # 读取一个限定取值的回答；没输入、输入不认识的内容，一律当作“不动”
 $script:answerQueue = New-Object System.Collections.Generic.Queue[string]
-if ($Answers) { foreach ($a in $Answers) { $script:answerQueue.Enqueue([string]$a) } }
+if ($Answers) {
+    foreach ($a in $Answers) {
+        # 兼容 pwsh -File 传入逗号分隔字符串（如 -Answers '1,关'）
+        foreach ($part in ([string]$a -split ',')) {
+            $script:answerQueue.Enqueue($part)
+        }
+    }
+}
 
 function Read-Answer {
     param([string[]]$Allowed, [string]$Prompt)

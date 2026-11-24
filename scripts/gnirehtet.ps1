@@ -121,8 +121,8 @@ function Invoke-Tool {
     Write-Host ('执行：' + $Exe + ' ' + ($Arguments -join ' ')) -ForegroundColor Cyan
     Push-Location -LiteralPath $p.ToolsDir
     try {
-        & $Exe @Arguments
-        return $LASTEXITCODE
+        & $Exe @Arguments | Out-Host
+        return [int]$LASTEXITCODE
     } finally {
         Pop-Location
     }
