@@ -70,11 +70,16 @@ gnirehtet.bat -Action auto -Serial <序列号> -Yes  :: 多设备或无人值守
   - 让手机**连上任意一个 Wi-Fi**（即使该 Wi-Fi 没有外网也可以；系统提示“不可上网”时点「保持连接」）。
   - **放心，流量依然 100% 走 USB 电脑**：`gnirehtet` 建立的是全局不可绕过 VPN（`0.0.0.0/0 -> tun0`），Wi-Fi 仅用来满足系统的在线状态位。
 
-### 2. 用着用着突然所有 App 都断网了？
-- **原因**：小米 HyperOS / MIUI、华为、OPPO 等国产系统会激进清理后台，把 `gnirehtet` 客户端强杀掉（电脑日志出现 `Client #0 disconnected`）。
-- **解决办法**：
-  - 本包启动时已自动尝试通过 ADB 把 `com.genymobile.gnirehtet` 加入省电白名单。
-  - 若仍被杀后台，请在手机「最近任务」里把 `gnirehtet` 卡片**下拉锁定**，并在应用详情中把省电策略设为 **无限制**；断线后重新双击 `gnirehtet.bat` 即可恢复。
+### 2. 数据线松动或锁屏时间久了断网怎么办？
+- **原因**：USB 线轻微松动、电脑 USB 休眠或设备进入 `offline` 会导致 `adb reverse` 隧道映射丢失；小米 HyperOS / MIUI、华为、OPPO 等国产系统在锁屏久了后也可能清理后台或挂起 `gnirehtet` 服务。
+- **已内置自动修复**：
+  - `gnirehtet.bat` 启动后会自动开启断连自愈守护（每 3 秒巡检一次）：
+    1. 检测到设备 `offline` 时自动执行 `adb reconnect`（连续多次失败则自动重启 `adb server`）；
+    2. 数据线拔插重连或 `adb reverse` 隧道丢失时自动重建隧道，若客户端未回连则自动重启手机端服务；
+    3. 检测到手机端 `GnirehtetService` 停止或 31416 端口长时间无客户端连接时，自动重新下发省电白名单并重启客户端。
+- **极端情况补充**：
+  - 本包启动及重启客户端时都会自动尝试通过 ADB 把 `com.genymobile.gnirehtet` 加入省电白名单与后台白名单。
+  - 若个别机型锁屏后仍频繁拦截弹出 VPN 权限，请在手机「最近任务」里把 `gnirehtet` 卡片**下拉锁定**，并在应用详情中把省电策略设为 **无限制**。
 
 ### 3. `ping` 不通是不是没网？
 - **不是**。`gnirehtet` 只转发 **TCP 和 UDP**，不转发 ICMP（`ping` 永远超时），请用浏览器打开网页或 App 实测。

@@ -23,3 +23,4 @@
 - 用户使用与排错细节：[docs/GUIDE.md](docs/GUIDE.md)
 - 离线构建与清单生成：[scripts/build_package.ps1](scripts/build_package.ps1)
 - Win7 依赖与驱动绑定实现：[scripts/lib/Win7Deps.ps1](scripts/lib/Win7Deps.ps1)
+- 断连自愈守护实现：[scripts/lib/TunnelWatchdog.ps1](scripts/lib/TunnelWatchdog.ps1)

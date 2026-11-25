@@ -285,7 +285,8 @@ function Invoke-ProcessCapture {
     param(
         [string]$FilePath,
         [string[]]$Arguments = @(),
-        [int]$TimeoutSeconds = 20
+        [int]$TimeoutSeconds = 20,
+        [string]$WorkingDirectory = ''
     )
 
     $outFile = Join-Path $env:TEMP ('cap-out-' + [guid]::NewGuid().ToString('N') + '.txt')
@@ -293,13 +294,20 @@ function Invoke-ProcessCapture {
     $result = New-Object PSObject -Property @{ ExitCode = $null; StdOut = ''; StdErr = ''; TimedOut = $false }
 
     try {
-        if ($Arguments -and $Arguments.Count -gt 0) {
-            $proc = Start-Process -FilePath $FilePath -ArgumentList $Arguments -NoNewWindow -PassThru `
-                -RedirectStandardOutput $outFile -RedirectStandardError $errFile
-        } else {
-            $proc = Start-Process -FilePath $FilePath -NoNewWindow -PassThru `
-                -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+        $spParams = @{
+            FilePath               = $FilePath
+            NoNewWindow            = $true
+            PassThru               = $true
+            RedirectStandardOutput = $outFile
+            RedirectStandardError  = $errFile
         }
+        if ($Arguments -and $Arguments.Count -gt 0) {
+            $spParams['ArgumentList'] = $Arguments
+        }
+        if ($WorkingDirectory) {
+            $spParams['WorkingDirectory'] = $WorkingDirectory
+        }
+        $proc = Start-Process @spParams
         # 缓存进程句柄，避免 Windows PowerShell 2.0/5.1 下 WaitForExit 后 ExitCode 为 $null
         $null = $proc.Handle
         # 只等这一个进程，避免 adb server 继承句柄导致管道挂起

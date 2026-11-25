@@ -50,6 +50,7 @@ if (-not $Root) { $Root = Split-Path -Parent $script:EntryDir }
 . (Join-Path $script:EntryDir 'lib\EnvFix.ps1')
 . (Join-Path $script:EntryDir 'lib\AdbDevices.ps1')
 . (Join-Path $script:EntryDir 'lib\Win7Deps.ps1')
+. (Join-Path $script:EntryDir 'lib\TunnelWatchdog.ps1')
 
 $p = Get-GnirehtetPaths -Root $Root
 
@@ -218,9 +219,7 @@ function Resolve-EnvironmentAuto {
 
 function Try-WhitelistPowerSaving {
     param([string]$DeviceSerial)
-    try {
-        Invoke-ProcessCapture -FilePath $p.AdbExe -Arguments @('-s', $DeviceSerial, 'shell', 'dumpsys', 'deviceidle', 'whitelist', '+com.genymobile.gnirehtet') -TimeoutSeconds 8 | Out-Null
-    } catch { }
+    Set-AndroidPowerSavingWhitelist -AdbExe $p.AdbExe -Serial $DeviceSerial
 }
 
 function Wait-AndResolveDevice {
@@ -433,6 +432,7 @@ if (-not (Ensure-AdbRuntimeReady)) {
 # 2. 进程级置顶本包目录与 ADB 环境变量（双保险，绝不用错系统里的 adb）
 $env:PATH = "$($p.ToolsDir);$env:PATH"
 $env:ADB  = $p.AdbExe
+$env:GNIREHTET_APK = $p.GnApk
 
 # 3. 自动处理环境与端口冲突
 if (-not (Resolve-EnvironmentAuto)) {
@@ -483,31 +483,25 @@ switch ($Action) {
     }
 
     default {
-        # auto / run：全自动一条龙
+        # auto / run：全自动一条龙（内置断连自愈守护）
         $dev = Wait-AndResolveDevice -AllowInteractiveWait:($Action -eq 'auto')
         if (-not $dev) { Exit-Clean 3 }
 
-        # 自动尝试加入省电白名单（减少国产系统杀后台）
-        Try-WhitelistPowerSaving -DeviceSerial $dev.Serial
-
+        $devLabel = Get-DeviceLabel -Device $dev
         Write-Host ''
-        Write-Host ("[*] 正在为「{0}」开启 USB 反向网络……" -f (Get-DeviceLabel -Device $dev)) -ForegroundColor Green
+        Write-Host ("[*] 正在为「{0}」开启 USB 反向网络……" -f $devLabel) -ForegroundColor Green
         Write-Host '    · 首次运行会自动在手机上安装 gnirehtet 客户端并弹出「VPN 网络连接请求」，请点「确定」'
+        Write-Host '    · 已开启断连自动恢复（数据线松动或锁屏休眠断开后会自动重连）'
         Write-Host '    · 保持本窗口不要关闭；用完按 Ctrl+C 即可自动停止并恢复手机网络'
         Write-Host '    · 提示：若个别国内 App 报无网络，让手机连上任意 Wi-Fi（无需外网）即可，流量仍走 USB'
         Write-Host ''
 
-        $code = 0
-        try {
-            $code = Invoke-Tool -Exe $p.GnExe -Arguments @('run', $dev.Serial)
-        } finally {
-            Write-Host ''
-            Write-Host '[*] 正在收尾：停止手机端反向网络……' -ForegroundColor DarkGray
-            try {
-                Invoke-ProcessCapture -FilePath $p.GnExe -Arguments @('stop', $dev.Serial) -TimeoutSeconds 8 | Out-Null
-                Write-Host '[完成] 已停止，手机已恢复原有网络。' -ForegroundColor Green
-            } catch { }
-        }
+        $code = Invoke-GnirehtetWatchdog `
+            -GnExe $p.GnExe `
+            -AdbExe $p.AdbExe `
+            -ToolsDir $p.ToolsDir `
+            -Serial $dev.Serial `
+            -DeviceLabel $devLabel
         Exit-Clean $code
     }
 }
