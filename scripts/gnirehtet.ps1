@@ -424,6 +424,9 @@ if ($Action -eq 'preflight') {
     Exit-Clean $LASTEXITCODE
 }
 
+# 0. 关闭控制台快速编辑模式，防止误点窗口进入「选择」状态冻结进程
+Disable-ConsoleQuickEdit | Out-Null
+
 # 1. 确保 Win7 运行库就绪（adb 能正常运行）
 if (-not (Ensure-AdbRuntimeReady)) {
     Exit-Clean 3
@@ -491,7 +494,7 @@ switch ($Action) {
         Write-Host ''
         Write-Host ("[*] 正在为「{0}」开启 USB 反向网络……" -f $devLabel) -ForegroundColor Green
         Write-Host '    · 首次运行会自动在手机上安装 gnirehtet 客户端并弹出「VPN 网络连接请求」，请点「确定」'
-        Write-Host '    · 已开启断连自动恢复（数据线松动或锁屏休眠断开后会自动重连）'
+        Write-Host '    · 已开启断连自动恢复与防窗口误点冻结保护（仅输出关键状态，不再刷屏）'
         Write-Host '    · 保持本窗口不要关闭；用完按 Ctrl+C 即可自动停止并恢复手机网络'
         Write-Host '    · 提示：若个别国内 App 报无网络，让手机连上任意 Wi-Fi（无需外网）即可，流量仍走 USB'
         Write-Host ''

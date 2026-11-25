@@ -281,6 +281,43 @@ function Find-PathExecutables {
     return $hits.ToArray()
 }
 
+function Read-SharedTextFile {
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return '' }
+    $fs = $null
+    $sr = $null
+    try {
+        $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+        $fs = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $share)
+        $sr = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::UTF8, $true)
+        return $sr.ReadToEnd()
+    } catch {
+        return ''
+    } finally {
+        if ($sr) { try { $sr.Close() } catch { } }
+        if ($fs) { try { $fs.Close() } catch { } }
+    }
+}
+
+function Stop-ChildProcessesBestEffort {
+    param([int]$ParentPid)
+    if ($ParentPid -le 0) { return }
+    try {
+        $children = @()
+        if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+            try { $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$ParentPid" -ErrorAction SilentlyContinue) } catch { $children = @() }
+        } elseif (Get-Command Get-WmiObject -ErrorAction SilentlyContinue) {
+            try { $children = @(Get-WmiObject Win32_Process -Filter "ParentProcessId=$ParentPid" -ErrorAction SilentlyContinue) } catch { $children = @() }
+        }
+        foreach ($c in $children) {
+            $cid = [int]$c.ProcessId
+            if ($cid -gt 0 -and $cid -ne $ParentPid) {
+                try { Stop-Process -Id $cid -Force -ErrorAction SilentlyContinue } catch { }
+            }
+        }
+    } catch { }
+}
+
 function Invoke-ProcessCapture {
     param(
         [string]$FilePath,
@@ -310,19 +347,21 @@ function Invoke-ProcessCapture {
         $proc = Start-Process @spParams
         # 缓存进程句柄，避免 Windows PowerShell 2.0/5.1 下 WaitForExit 后 ExitCode 为 $null
         $null = $proc.Handle
+        $procId = $proc.Id
         # 只等这一个进程，避免 adb server 继承句柄导致管道挂起
         if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
             $result.TimedOut = $true
             try { $proc.Kill() } catch { }
+            Stop-ChildProcessesBestEffort -ParentPid $procId
         } else {
             $proc.WaitForExit()
             $result.ExitCode = $proc.ExitCode
         }
         if (Test-Path -LiteralPath $outFile) {
-            $result.StdOut = [System.IO.File]::ReadAllText($outFile, [System.Text.Encoding]::UTF8)
+            $result.StdOut = Read-SharedTextFile -Path $outFile
         }
         if (Test-Path -LiteralPath $errFile) {
-            $result.StdErr = [System.IO.File]::ReadAllText($errFile, [System.Text.Encoding]::UTF8)
+            $result.StdErr = Read-SharedTextFile -Path $errFile
         }
     } catch {
         $result.StdErr = $_.Exception.Message
