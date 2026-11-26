@@ -177,6 +177,17 @@ public static class GnirehtetConsoleGuard {
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool SetConsoleCtrlHandler(ConsoleCtrlDelegate HandlerRoutine, bool Add);
 
+    private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool QueryFullProcessImageName(IntPtr hProcess, uint dwFlags, System.Text.StringBuilder lpExeName, ref int lpdwSize);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr hObject);
+
     private static readonly ConsoleCtrlDelegate _handler = new ConsoleCtrlDelegate(OnConsoleCtrl);
     private static readonly object _ctrlSync = new object();
     private static readonly object _ctxSync = new object();
@@ -425,6 +436,40 @@ public static class GnirehtetConsoleGuard {
         }
     }
 
+    public static string TryGetProcessPath(int pid) {
+        if (pid <= 0) {
+            return null;
+        }
+        IntPtr hProc = IntPtr.Zero;
+        try {
+            hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+            if (hProc == IntPtr.Zero) {
+                return null;
+            }
+            System.Text.StringBuilder sb = new System.Text.StringBuilder(1024);
+            int size = sb.Capacity;
+            if (QueryFullProcessImageName(hProc, 0, sb, ref size) && size > 0) {
+                return sb.ToString(0, size);
+            }
+            return null;
+        } catch {
+            return null;
+        } finally {
+            if (hProc != IntPtr.Zero) {
+                try { CloseHandle(hProc); } catch { }
+            }
+        }
+    }
+
+    public static void ForceKillOwnProcesses(string gnExe, string adbExe) {
+        if (!string.IsNullOrEmpty(gnExe)) {
+            KillProcessesByExactPath("gnirehtet", gnExe);
+        }
+        if (!string.IsNullOrEmpty(adbExe)) {
+            KillProcessesByExactPath("adb", adbExe);
+        }
+    }
+
     private static void KillProcessesByExactPath(string procBaseName, string expectedExePath) {
         if (string.IsNullOrEmpty(expectedExePath)) {
             return;
@@ -451,11 +496,13 @@ public static class GnirehtetConsoleGuard {
                 if (proc.HasExited) {
                     continue;
                 }
-                string modPath = null;
-                try {
-                    modPath = proc.MainModule != null ? proc.MainModule.FileName : null;
-                } catch {
-                    modPath = null;
+                string modPath = TryGetProcessPath(proc.Id);
+                if (string.IsNullOrEmpty(modPath)) {
+                    try {
+                        modPath = proc.MainModule != null ? proc.MainModule.FileName : null;
+                    } catch {
+                        modPath = null;
+                    }
                 }
                 if (string.IsNullOrEmpty(modPath)) {
                     continue;

@@ -239,11 +239,16 @@ function Stop-VerifiedProcessByIdentity {
     } catch { }
 
     $elapsed = 0
+    $usedTaskkill = $false
     while ($elapsed -lt $WaitMs) {
         $after = Get-CimProcess -ProcessId $ProcessId
         if (-not $after) { return $true }
         if ($ExpectedCreationDate -and $after.CreationDate -and ($after.CreationDate -ne $ExpectedCreationDate)) {
             return $true
+        }
+        if (-not $usedTaskkill -and $elapsed -ge 600) {
+            $usedTaskkill = $true
+            try { Invoke-ProcessCapture -FilePath 'taskkill.exe' -Arguments @('/F', '/T', '/PID', "$ProcessId") -TimeoutSeconds 5 | Out-Null } catch { }
         }
         Start-Sleep -Milliseconds 150
         $elapsed += 150

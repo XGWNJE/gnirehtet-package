@@ -93,11 +93,33 @@ function Get-FileSha256 {
     }
 }
 
+function Get-ProcessPathFallback {
+    param([int]$ProcessId)
+    if ($ProcessId -le 0) { return $null }
+    if ('GnirehtetConsoleGuard' -as [type]) {
+        try { return ([GnirehtetConsoleGuard]::TryGetProcessPath($ProcessId)) } catch { }
+    }
+    return $null
+}
+
 function Get-CimProcess {
     param([int]$ProcessId)
     if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
         try {
-            return (Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction Stop)
+            $c = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction Stop
+            if ($c -and -not $c.ExecutablePath) {
+                $fb = Get-ProcessPathFallback -ProcessId $ProcessId
+                if ($fb) {
+                    return (New-Object PSObject -Property @{
+                        ProcessId      = [int]$c.ProcessId
+                        Name           = $c.Name
+                        ExecutablePath = $fb
+                        CommandLine    = $c.CommandLine
+                        CreationDate   = $c.CreationDate
+                    })
+                }
+            }
+            return $c
         } catch { }
     }
     if (Get-Command Get-WmiObject -ErrorAction SilentlyContinue) {
@@ -108,10 +130,12 @@ function Get-CimProcess {
                 if ($w.CreationDate) {
                     try { $cd = [Management.ManagementDateTimeConverter]::ToDateTime($w.CreationDate) } catch { $cd = $w.CreationDate }
                 }
+                $ep = $w.ExecutablePath
+                if (-not $ep) { $ep = Get-ProcessPathFallback -ProcessId $ProcessId }
                 return (New-Object PSObject -Property @{
                     ProcessId      = [int]$w.ProcessId
                     Name           = $w.Name
-                    ExecutablePath = $w.ExecutablePath
+                    ExecutablePath = $ep
                     CommandLine    = $w.CommandLine
                     CreationDate   = $cd
                 })
@@ -122,6 +146,7 @@ function Get-CimProcess {
         $p = Get-Process -Id $ProcessId -ErrorAction Stop
         $pPath = $null; $pStart = $null
         try { $pPath = $p.Path } catch { }
+        if (-not $pPath) { $pPath = Get-ProcessPathFallback -ProcessId $ProcessId }
         try { $pStart = $p.StartTime } catch { }
         return (New-Object PSObject -Property @{
             ProcessId      = [int]$p.Id
@@ -208,9 +233,11 @@ function Get-ProcessListByName {
         try {
             return @(Get-CimInstance Win32_Process -Filter "Name='$ExeName'" -ErrorAction Stop |
                 ForEach-Object {
+                    $ep = $_.ExecutablePath
+                    if (-not $ep) { $ep = Get-ProcessPathFallback -ProcessId ([int]$_.ProcessId) }
                     New-Object PSObject -Property @{
                         PID          = [int]$_.ProcessId
-                        Path         = $_.ExecutablePath
+                        Path         = $ep
                         CommandLine  = $_.CommandLine
                         CreationDate = $_.CreationDate
                     }
@@ -225,9 +252,11 @@ function Get-ProcessListByName {
                     if ($_.CreationDate) {
                         try { $cd = [Management.ManagementDateTimeConverter]::ToDateTime($_.CreationDate) } catch { $cd = $_.CreationDate }
                     }
+                    $ep = $_.ExecutablePath
+                    if (-not $ep) { $ep = Get-ProcessPathFallback -ProcessId ([int]$_.ProcessId) }
                     New-Object PSObject -Property @{
                         PID          = [int]$_.ProcessId
-                        Path         = $_.ExecutablePath
+                        Path         = $ep
                         CommandLine  = $_.CommandLine
                         CreationDate = $cd
                     }
@@ -239,6 +268,7 @@ function Get-ProcessListByName {
         ForEach-Object {
             $pPath = $null; $pStart = $null
             try { $pPath = $_.Path } catch { }
+            if (-not $pPath) { $pPath = Get-ProcessPathFallback -ProcessId ([int]$_.Id) }
             try { $pStart = $_.StartTime } catch { }
             New-Object PSObject -Property @{
                 PID          = [int]$_.Id

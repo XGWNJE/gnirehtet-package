@@ -282,7 +282,14 @@ function Wait-AndResolveDevice {
                 Write-Host '[等待授权] 已检测到手机，请在手机屏幕上点击「允许 USB 调试」（建议勾选始终允许）……' -ForegroundColor Cyan
                 Write-Host '           点完后这里会自动继续，无需任何操作（按 Ctrl+C 可取消）。' -ForegroundColor DarkGray
                 for ($w = 0; $w -lt 45; $w++) {
-                    Start-Sleep -Seconds 2
+                    if (('GnirehtetConsoleGuard' -as [type]) -and [GnirehtetConsoleGuard]::IsStopRequested) {
+                        return $null
+                    }
+                    if ('GnirehtetConsoleGuard' -as [type]) {
+                        if ([GnirehtetConsoleGuard]::WaitStop(2000)) { return $null }
+                    } else {
+                        Start-Sleep -Seconds 2
+                    }
                     $reProbe = Get-AdbDevices -AdbExe $p.AdbExe
                     if ($reProbe.Ok) {
                         $reUsable = @($reProbe.Devices | Where-Object { $_.State -eq 'device' })
@@ -465,6 +472,14 @@ $adbPortNow = Get-AdbServerPort
 $isWatchdogAction = (@('auto', 'run') -contains $Action)
 $shouldCleanupOwnAdbOnExit = $isWatchdogAction -or ($Action -eq 'stop') -or ($ownAdbStartedByUs -and -not $hadOtherOwnGnBefore)
 
+if ($isWatchdogAction -or $Action -eq 'stop') {
+    try {
+        if (Ensure-GnirehtetWatchdogNative) {
+            [GnirehtetConsoleGuard]::EnableGracefulStop()
+        }
+    } catch { }
+}
+
 if ($isWatchdogAction -and $null -ne $ownAdbNow -and -not $hadOtherOwnGnBefore) {
     Attach-OwnAdbServerToJob -AdbExe $p.AdbExe | Out-Null
     try {
@@ -533,6 +548,10 @@ try {
             $selectedDev = Wait-AndResolveDevice -AllowInteractiveWait:($Action -eq 'auto')
             if (-not $selectedDev) {
                 $exitCode = 3
+                if (('GnirehtetConsoleGuard' -as [type]) -and [GnirehtetConsoleGuard]::IsStopRequested) {
+                    $exitCode = 0
+                    $skipPause = $true
+                }
             } else {
                 $devLabel = Get-DeviceLabel -Device $selectedDev
                 Write-Host ''
@@ -573,11 +592,24 @@ try {
                     Write-Host '[完成] 当前没有本包残留后台进程。' -ForegroundColor Green
                 }
             }
+            if ($cleanRes -and -not $cleanRes.Clean -and ('GnirehtetConsoleGuard' -as [type])) {
+                $gnArg = if ($skipGnClean) { '' } else { $p.GnExe }
+                $adbArg = if ($cleanRes.SkippedAdbForActiveSession) { '' } else { $p.AdbExe }
+                [GnirehtetConsoleGuard]::ForceKillOwnProcesses($gnArg, $adbArg)
+            }
         }
-    } catch { }
+    } catch {
+        try {
+            if ($shouldCleanupOwnAdbOnExit -and -not $skipPreWatchdogCleanup -and ('GnirehtetConsoleGuard' -as [type])) {
+                $gnArg = if ($isReadOrInstallAction) { '' } else { $p.GnExe }
+                [GnirehtetConsoleGuard]::ForceKillOwnProcesses($gnArg, $p.AdbExe)
+            }
+        } catch { }
+    }
     try {
         if ('GnirehtetConsoleGuard' -as [type]) {
             [GnirehtetConsoleGuard]::ClearShutdownCleanup()
+            [GnirehtetConsoleGuard]::DisableGracefulStop()
         }
     } catch { }
     Close-SessionProcessJob
