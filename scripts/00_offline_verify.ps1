@@ -344,18 +344,27 @@ try {
 
     # ------------------------------------------------------------ 4 端口 31416
     Add-Section '4. TCP 31416 占用情况'
-    # 兼容 Win7（无 Get-NetTCPConnection 时自动降级 netstat）
-    $port31416 = if (Get-Command Get-TcpPortConnections -ErrorAction SilentlyContinue) {
+    # 兼容 Win7（无 Get-NetTCPConnection 时自动降级 netstat）；仅将 Listen 状态视为端口占用，TIME_WAIT 不阻断
+    $port31416Listen = if (Get-Command Get-TcpPortConnections -ErrorAction SilentlyContinue) {
+        @(Get-TcpPortConnections -Port 31416 -ListenOnly)
+    } else {
+        @(Get-NetTCPConnection -LocalPort 31416 -State Listen -ErrorAction SilentlyContinue)
+    }
+    $port31416All = if (Get-Command Get-TcpPortConnections -ErrorAction SilentlyContinue) {
         @(Get-TcpPortConnections -Port 31416)
     } else {
         @(Get-NetTCPConnection -LocalPort 31416 -ErrorAction SilentlyContinue)
     }
 
-    if ($port31416.Count -eq 0) {
-        Add-Check -Name '端口 31416' -Status PASS -Detail '当前无监听/连接，可分配'
+    if ($port31416Listen.Count -eq 0) {
+        Add-Check -Name '端口 31416' -Status PASS -Detail '当前无监听，可分配'
+        $nonListenCount = @($port31416All | Where-Object { $_.State -ne 'Listen' }).Count
+        if ($nonListenCount -gt 0) {
+            Add-Check -Name '端口 31416 非监听连接' -Status INFO -Detail ("存在 {0} 条非监听连接（多为刚退出后的 TIME_WAIT，不影响下次启动）" -f $nonListenCount)
+        }
     } else {
         Add-Check -Name '端口 31416 已被占用' -Status FAIL -Detail 'gnirehtet relay 默认监听此端口，需先由人工处理' -Blocking
-        foreach ($c in $port31416) {
+        foreach ($c in $port31416Listen) {
             $procName = ''
             $procPath = ''
             try {

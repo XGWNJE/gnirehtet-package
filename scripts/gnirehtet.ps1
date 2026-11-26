@@ -62,8 +62,13 @@ function Wait-ExitPause {
 }
 
 function Exit-Clean {
-    param([int]$Code = 0)
-    Wait-ExitPause
+    param(
+        [int]$Code = 0,
+        [switch]$SkipPause
+    )
+    if (-not $SkipPause) {
+        Wait-ExitPause
+    }
     exit $Code
 }
 
@@ -124,12 +129,15 @@ function Ensure-AdbRuntimeReady {
 }
 
 function Resolve-EnvironmentAuto {
-    # 1. 自动清理本包残留的 gnirehtet 进程（静默处理，不打扰用户）
-    $targets = @(Get-InterferenceTargets -Root $Root)
-    foreach ($t in $targets) {
-        if ($t.Own -and ($t.Kind -eq 'process' -or ($t.Kind -eq 'port' -and $t.Port -eq 31416))) {
-            Write-Host ("[*] 检测到上次残留的 gnirehtet（PID {0}），正在自动清理……" -f $t.Pid) -ForegroundColor DarkGray
-            Stop-InterferenceTarget -Target $t -Root $Root | Out-Null
+    param([switch]$SkipOwnGnirehtetCleanup)
+    # 1. 自动清理本包残留的 gnirehtet 进程（静默处理，不打扰用户；只读查询/安装不误杀活跃会话）
+    if (-not $SkipOwnGnirehtetCleanup) {
+        $targets = @(Get-InterferenceTargets -Root $Root)
+        foreach ($t in $targets) {
+            if ($t.Own -and ($t.Kind -eq 'process' -or ($t.Kind -eq 'port' -and $t.Port -eq 31416))) {
+                Write-Host ("[*] 检测到上次残留的 gnirehtet（PID {0}），正在自动清理……" -f $t.Pid) -ForegroundColor DarkGray
+                Stop-InterferenceTarget -Target $t -Root $Root | Out-Null
+            }
         }
     }
 
@@ -438,73 +446,141 @@ $env:ADB  = $p.AdbExe
 $env:GNIREHTET_APK = $p.GnApk
 
 # 3. 自动处理环境与端口冲突
-if (-not (Resolve-EnvironmentAuto)) {
+$isReadOrInstallAction = (@('status', 'install') -contains $Action)
+if (-not (Resolve-EnvironmentAuto -SkipOwnGnirehtetCleanup:$isReadOrInstallAction)) {
     Exit-Clean 3
 }
 
-# 4. 独立拉起 adb server
+# 4. 独立拉起 adb server（记录是否由本会话拉起，用于退出时无残留清理）
+$hadOwnAdbBefore = ($null -ne (Test-OwnAdbOnCurrentPort -AdbExe $p.AdbExe))
+$hadOtherOwnGnBefore = (@(Get-GnirehtetProcessList | Where-Object { Test-OwnGnirehtetProcEntry -ProcEntry $_ -GnExePath $p.GnExe }).Count -gt 0)
+
 if (-not (Initialize-AdbServer -AdbExe $p.AdbExe)) {
     Write-Host '[注意] adb 服务启动超时，将尝试直接继续。' -ForegroundColor Yellow
 }
 
-switch ($Action) {
+$ownAdbNow = Test-OwnAdbOnCurrentPort -AdbExe $p.AdbExe
+$ownAdbStartedByUs = (-not $hadOwnAdbBefore -and $null -ne $ownAdbNow)
+$adbPortNow = Get-AdbServerPort
+$isWatchdogAction = (@('auto', 'run') -contains $Action)
+$shouldCleanupOwnAdbOnExit = $isWatchdogAction -or ($Action -eq 'stop') -or ($ownAdbStartedByUs -and -not $hadOtherOwnGnBefore)
 
-    'status' {
-        $probe = Get-AdbDevices -AdbExe $p.AdbExe
-        if (-not $probe.Ok) {
-            Write-Host '[错误] adb 执行失败：' -ForegroundColor Red
-            Write-Host $probe.Raw
-            Exit-Clean 2
+if ($isWatchdogAction -and $null -ne $ownAdbNow -and -not $hadOtherOwnGnBefore) {
+    Attach-OwnAdbServerToJob -AdbExe $p.AdbExe | Out-Null
+    try {
+        if (Ensure-GnirehtetWatchdogNative) {
+            [GnirehtetConsoleGuard]::ConfigureShutdownCleanup($null, $p.GnExe, $p.AdbExe, $p.ToolsDir, '', $adbPortNow, $true)
         }
-        Write-Host ''
-        Show-Devices -Devices @($probe.Devices)
-        Exit-Clean 0
-    }
-
-    'install' {
-        $dev = Wait-AndResolveDevice
-        if (-not $dev) { Exit-Clean 3 }
-        Write-Host ("[*] 正在给 {0} 安装客户端……" -f (Get-DeviceLabel -Device $dev)) -ForegroundColor Cyan
-        $code = Invoke-Tool -Exe $p.GnExe -Arguments @('install', $dev.Serial)
-        if ($code -eq 0) {
-            Write-Host '[通过] 客户端安装成功。' -ForegroundColor Green
-        } else {
-            Write-Host ("[失败] 安装失败（退出码 {0}），请检查手机是否弹出「允许通过 USB 安装」。" -f $code) -ForegroundColor Yellow
-        }
-        Exit-Clean $code
-    }
-
-    'stop' {
-        $dev = Wait-AndResolveDevice
-        if (-not $dev) { Exit-Clean 3 }
-        Write-Host ("[*] 正在停止 {0} 上的反向网络……" -f (Get-DeviceLabel -Device $dev)) -ForegroundColor Cyan
-        $code = Invoke-Tool -Exe $p.GnExe -Arguments @('stop', $dev.Serial)
-        if ($code -eq 0) {
-            Write-Host '[通过] 已停止，手机已恢复原网络。' -ForegroundColor Green
-        }
-        Exit-Clean $code
-    }
-
-    default {
-        # auto / run：全自动一条龙（内置断连自愈守护）
-        $dev = Wait-AndResolveDevice -AllowInteractiveWait:($Action -eq 'auto')
-        if (-not $dev) { Exit-Clean 3 }
-
-        $devLabel = Get-DeviceLabel -Device $dev
-        Write-Host ''
-        Write-Host ("[*] 正在为「{0}」开启 USB 反向网络……" -f $devLabel) -ForegroundColor Green
-        Write-Host '    · 首次运行会自动在手机上安装 gnirehtet 客户端并弹出「VPN 网络连接请求」，请点「确定」'
-        Write-Host '    · 已开启断连自动恢复与防窗口误点冻结保护（仅输出关键状态，不再刷屏）'
-        Write-Host '    · 保持本窗口不要关闭；用完按 Ctrl+C 即可自动停止并恢复手机网络'
-        Write-Host '    · 提示：若个别国内 App 报无网络，让手机连上任意 Wi-Fi（无需外网）即可，流量仍走 USB'
-        Write-Host ''
-
-        $code = Invoke-GnirehtetWatchdog `
-            -GnExe $p.GnExe `
-            -AdbExe $p.AdbExe `
-            -ToolsDir $p.ToolsDir `
-            -Serial $dev.Serial `
-            -DeviceLabel $devLabel
-        Exit-Clean $code
-    }
+    } catch { }
 }
+
+$exitCode = 0
+$skipPause = $false
+$selectedDev = $null
+
+try {
+    switch ($Action) {
+
+        'status' {
+            $probe = Get-AdbDevices -AdbExe $p.AdbExe
+            if (-not $probe.Ok) {
+                Write-Host '[错误] adb 执行失败：' -ForegroundColor Red
+                Write-Host $probe.Raw
+                $exitCode = 2
+            } else {
+                Write-Host ''
+                Show-Devices -Devices @($probe.Devices)
+                $exitCode = 0
+            }
+        }
+
+        'install' {
+            $selectedDev = Wait-AndResolveDevice
+            if (-not $selectedDev) {
+                $exitCode = 3
+            } else {
+                Write-Host ("[*] 正在给 {0} 安装客户端……" -f (Get-DeviceLabel -Device $selectedDev)) -ForegroundColor Cyan
+                $code = Invoke-Tool -Exe $p.GnExe -Arguments @('install', $selectedDev.Serial)
+                if ($code -eq 0) {
+                    Write-Host '[通过] 客户端安装成功。' -ForegroundColor Green
+                } else {
+                    Write-Host ("[失败] 安装失败（退出码 {0}），请检查手机是否弹出「允许通过 USB 安装」。" -f $code) -ForegroundColor Yellow
+                }
+                $exitCode = $code
+            }
+        }
+
+        'stop' {
+            $selectedDev = Wait-AndResolveDevice
+            if (-not $selectedDev) {
+                Write-Host '[*] 未检测到已连接手机，将直接清理本包残留后台进程……' -ForegroundColor Yellow
+                $exitCode = 0
+            } else {
+                Write-Host ("[*] 正在停止 {0} 上的反向网络……" -f (Get-DeviceLabel -Device $selectedDev)) -ForegroundColor Cyan
+                $code = Invoke-Tool -Exe $p.GnExe -Arguments @('stop', $selectedDev.Serial)
+                try {
+                    Invoke-ProcessCapture -FilePath $p.AdbExe -Arguments @('-s', $selectedDev.Serial, 'reverse', '--remove', 'localabstract:gnirehtet') -TimeoutSeconds 3 | Out-Null
+                } catch { }
+                if ($code -eq 0) {
+                    Write-Host '[通过] 已停止，手机已恢复原网络。' -ForegroundColor Green
+                }
+                $exitCode = $code
+            }
+        }
+
+        default {
+            # auto / run：全自动一条龙（内置断连自愈守护）
+            $selectedDev = Wait-AndResolveDevice -AllowInteractiveWait:($Action -eq 'auto')
+            if (-not $selectedDev) {
+                $exitCode = 3
+            } else {
+                $devLabel = Get-DeviceLabel -Device $selectedDev
+                Write-Host ''
+                Write-Host ("[*] 正在为「{0}」开启 USB 反向网络……" -f $devLabel) -ForegroundColor Green
+                Write-Host '    · 首次运行会自动在手机上安装 gnirehtet 客户端并弹出「VPN 网络连接请求」，请点「确定」'
+                Write-Host '    · 已开启断连自动恢复与防窗口误点冻结保护（仅输出关键状态，不再刷屏）'
+                Write-Host '    · 保持本窗口不要关闭；用完按 Ctrl+C 或关闭窗口即可自动停止并释放所有后台进程'
+                Write-Host '    · 提示：若个别国内 App 报无网络，让手机连上任意 Wi-Fi（无需外网）即可，流量仍走 USB'
+                Write-Host ''
+
+                $code = Invoke-GnirehtetWatchdog `
+                    -GnExe $p.GnExe `
+                    -AdbExe $p.AdbExe `
+                    -ToolsDir $p.ToolsDir `
+                    -Serial $selectedDev.Serial `
+                    -DeviceLabel $devLabel `
+                    -Root $Root `
+                    -StopOwnAdbOnExit
+                $exitCode = $code
+                if ($code -eq 0 -and ('GnirehtetConsoleGuard' -as [type]) -and [GnirehtetConsoleGuard]::IsStopRequested) {
+                    $skipPause = $true
+                }
+            }
+        }
+    }
+} finally {
+    try {
+        $skipPreWatchdogCleanup = ($isWatchdogAction -and $null -eq $selectedDev -and $hadOtherOwnGnBefore)
+        if ($shouldCleanupOwnAdbOnExit -and -not $skipPreWatchdogCleanup) {
+            $keepOther = ($Action -ne 'stop')
+            $skipGnClean = $isReadOrInstallAction
+            $quietClean = ($isWatchdogAction -and $null -ne $selectedDev) -or $isReadOrInstallAction
+            $cleanRes = Stop-OwnPackageProcesses -Root $Root -StopAdbServer -KeepAdbIfOtherGnirehtetRunning:$keepOther -SkipGnirehtet:$skipGnClean -Quiet:$quietClean
+            if ($Action -eq 'stop' -and -not $selectedDev -and $cleanRes) {
+                if ($cleanRes.StoppedGnirehtetPids.Count -gt 0 -or $cleanRes.StoppedAdbPids.Count -gt 0) {
+                    Write-Host '[完成] 已清理本包残留后台进程，目录与端口已释放。' -ForegroundColor Green
+                } else {
+                    Write-Host '[完成] 当前没有本包残留后台进程。' -ForegroundColor Green
+                }
+            }
+        }
+    } catch { }
+    try {
+        if ('GnirehtetConsoleGuard' -as [type]) {
+            [GnirehtetConsoleGuard]::ClearShutdownCleanup()
+        }
+    } catch { }
+    Close-SessionProcessJob
+}
+
+Exit-Clean -Code $exitCode -SkipPause:$skipPause

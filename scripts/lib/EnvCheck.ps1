@@ -299,9 +299,10 @@ function Read-SharedTextFile {
     }
 }
 
-function Stop-ChildProcessesBestEffort {
+function Get-ChildProcessIdsBestEffort {
     param([int]$ParentPid)
-    if ($ParentPid -le 0) { return }
+    $pids = New-Object System.Collections.Generic.List[int]
+    if ($ParentPid -le 0) { return @() }
     try {
         $children = @()
         if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
@@ -312,10 +313,34 @@ function Stop-ChildProcessesBestEffort {
         foreach ($c in $children) {
             $cid = [int]$c.ProcessId
             if ($cid -gt 0 -and $cid -ne $ParentPid) {
-                try { Stop-Process -Id $cid -Force -ErrorAction SilentlyContinue } catch { }
+                $pids.Add($cid)
             }
         }
     } catch { }
+    return $pids.ToArray()
+}
+
+function Stop-ChildProcessesBestEffort {
+    param(
+        [int]$ParentPid,
+        [int[]]$KnownChildPids = @()
+    )
+    if ($ParentPid -le 0 -and (-not $KnownChildPids -or $KnownChildPids.Count -eq 0)) { return }
+    $seen = @{}
+    foreach ($cid in @($KnownChildPids)) {
+        if ($cid -gt 0 -and $cid -ne $ParentPid -and -not $seen.ContainsKey($cid)) {
+            $seen[$cid] = $true
+            try { Stop-Process -Id $cid -Force -ErrorAction SilentlyContinue } catch { }
+        }
+    }
+    if ($ParentPid -gt 0) {
+        foreach ($cid in @(Get-ChildProcessIdsBestEffort -ParentPid $ParentPid)) {
+            if ($cid -gt 0 -and $cid -ne $ParentPid -and -not $seen.ContainsKey($cid)) {
+                $seen[$cid] = $true
+                try { Stop-Process -Id $cid -Force -ErrorAction SilentlyContinue } catch { }
+            }
+        }
+    }
 }
 
 function Invoke-ProcessCapture {
@@ -351,8 +376,9 @@ function Invoke-ProcessCapture {
         # 只等这一个进程，避免 adb server 继承句柄导致管道挂起
         if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
             $result.TimedOut = $true
+            $childPids = @(Get-ChildProcessIdsBestEffort -ParentPid $procId)
             try { $proc.Kill() } catch { }
-            Stop-ChildProcessesBestEffort -ParentPid $procId
+            Stop-ChildProcessesBestEffort -ParentPid $procId -KnownChildPids $childPids
         } else {
             $proc.WaitForExit()
             $result.ExitCode = $proc.ExitCode
@@ -503,7 +529,7 @@ function Invoke-EnvPreflight {
                 if ($seen31416Pids.ContainsKey($s.PID)) { continue }
                 $seen31416Pids[$s.PID] = $true
             }
-            $isOwn = ($s.Name -ieq 'gnirehtet.exe')
+            $isOwn = if ($s.Path) { Test-SamePath $s.Path $p.GnExe } else { ($s.Name -ieq 'gnirehtet.exe') }
             $findings.Add((New-Finding -Severity $(if ($isOwn) { 'WARN' } else { 'BLOCKER' }) -Id 'port-31416-busy' `
                 -Title '31416 已被占用' `
                 -Detail "占用者：$($s.Name)（PID $($s.PID)）。$($(if ($isOwn) { '看起来是本包 relay 残留。' } else { '不是 gnirehtet，启动 relay 会失败。' }))" `

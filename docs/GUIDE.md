@@ -19,7 +19,7 @@
    - 首次运行时会自动安装手机端 `gnirehtet` 客户端并弹出 **「网络连接请求 / VPN 授权」**，点 **确定**。
 4. **保持窗口开启**：
    - 看到日志正常滚动后即可上网。
-   - 用完在窗口按 **`Ctrl + C`**，程序会自动停止手机端 VPN 并恢复手机原有网络。
+   - 用完在窗口按 **`Ctrl + C`** 或直接关闭窗口，程序会自动停止手机端 VPN、恢复手机原有网络，并释放本包拉起的 `gnirehtet.exe` 与 `adb.exe` 后台进程（不影响电脑上其它软件自己的 ADB 服务）；退出后即可直接移动/删除目录或安全弹出 U 盘。
 
 ---
 
@@ -50,7 +50,7 @@
 ```cmd
 gnirehtet.bat                              :: 全自动一键运行（双击默认模式）
 gnirehtet.bat -Action status               :: 只查看已识别的手机
-gnirehtet.bat -Action stop                 :: 手动停止手机端 VPN
+gnirehtet.bat -Action stop                 :: 手动停止手机端 VPN 并释放本包后台进程
 gnirehtet.bat -Action install-deps         :: 立即安装全部内置运行库和 USB 驱动
 gnirehtet.bat -Action verify               :: 离线验收包完整性、SHA256 与脚本语法
 gnirehtet.bat -Action preflight            :: 只读环境体检（查 5037 / 31416 端口占用）

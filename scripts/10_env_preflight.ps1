@@ -228,14 +228,13 @@ try {
         Add-Out ('=' * 68)
         $didSomething = $false
 
-        $own = @($before.Findings | Where-Object { $_.Id -eq 'adb-server-own' })
-        if ($own.Count -gt 0 -and (Test-Path -LiteralPath $p.AdbExe)) {
-            Add-Out '[执行] 让本包自己的 adb 服务退出'
-            $cap = Invoke-ProcessCapture -FilePath $p.AdbExe -Arguments @('kill-server') -TimeoutSeconds 15
-            foreach ($l in (($cap.StdOut + $cap.StdErr) -split "`r?`n" | Where-Object { $_.Trim() })) {
-                Add-Out ('       ' + $l)
-            }
-            Add-Out ('       退出码：' + $cap.ExitCode)
+        $cleanRes = Stop-OwnPackageProcesses -Root $Root -StopAdbServer -Quiet
+        if ($cleanRes.StoppedGnirehtetPids.Count -gt 0) {
+            Add-Out ('[执行] 已清理本包残留 gnirehtet 进程：PID ' + ($cleanRes.StoppedGnirehtetPids -join ', '))
+            $didSomething = $true
+        }
+        if ($cleanRes.StoppedAdbPids.Count -gt 0) {
+            Add-Out ('[执行] 已关闭本包自己的 adb 服务：PID ' + ($cleanRes.StoppedAdbPids -join ', '))
             $didSomething = $true
         }
 
@@ -249,7 +248,10 @@ try {
         }
 
         $untouched = @($before.Findings | Where-Object {
-                (@('BLOCKER', 'WARN') -contains $_.Severity) -and ($_.Id -ne 'adb-server-own')
+                (@('BLOCKER', 'WARN') -contains $_.Severity) -and
+                ($_.Id -ne 'adb-server-own') -and
+                ($_.Id -ne 'gnirehtet-running') -and
+                (-not ($_.Id -eq 'port-31416-busy' -and $_.Severity -eq 'WARN'))
             })
         if ($untouched.Count -gt 0) {
             Add-Out ''

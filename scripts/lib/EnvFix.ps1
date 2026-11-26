@@ -73,7 +73,7 @@ function Get-InterferenceTargets {
     foreach ($s in @(Get-PortOwners -Port 31416 -ListenOnly)) {
         if (-not $s.PID -or $seen.ContainsKey($s.PID)) { continue }
         $seen[$s.PID] = $true
-        $own = ($s.Name -ieq 'gnirehtet.exe')
+        $own = if ($s.Path) { Test-SamePath $s.Path $p.GnExe } else { ($s.Name -ieq 'gnirehtet.exe') }
         $targets.Add((New-Object PSObject -Property @{
             Kind         = 'port'
             Port         = 31416
@@ -101,6 +101,13 @@ function Get-InterferenceTargets {
     foreach ($g in @(Get-GnirehtetProcessList)) {
         if ($seen.ContainsKey($g.PID)) { continue }
         $seen[$g.PID] = $true
+        $own = if ($g.Path) {
+            Test-SamePath $g.Path $p.GnExe
+        } elseif ($g.CommandLine) {
+            $g.CommandLine.IndexOf($p.GnExe, [StringComparison]::OrdinalIgnoreCase) -ge 0
+        } else {
+            $true
+        }
         $targets.Add((New-Object PSObject -Property @{
             Kind         = 'process'
             Port         = $null
@@ -108,7 +115,7 @@ function Get-InterferenceTargets {
             Name         = 'gnirehtet.exe'
             Path         = $g.Path
             CreationDate = $g.CreationDate
-            Own          = $true
+            Own          = $own
             Headline     = '这套工具还有进程没退出'
             Reason       = '残留进程可能占着设备或端口，让下一次启动行为变得难判断。'
             IfStopped    = '清理干净，可以重新开始。'
@@ -197,4 +204,200 @@ function Stop-InterferenceTarget {
     $result.Ok = $true
     $result.Message = '已经退出。'
     $result
+}
+
+function Test-OwnGnirehtetProcEntry {
+    param($ProcEntry, [string]$GnExePath)
+    if (-not $ProcEntry) { return $false }
+    if ($ProcEntry.Path) {
+        return (Test-SamePath $ProcEntry.Path $GnExePath)
+    }
+    if ($ProcEntry.CommandLine) {
+        return ($ProcEntry.CommandLine.IndexOf($GnExePath, [StringComparison]::OrdinalIgnoreCase) -ge 0)
+    }
+    return $false
+}
+
+function Stop-VerifiedProcessByIdentity {
+    param(
+        [int]$ProcessId,
+        [string]$ExpectedName = '',
+        [string]$ExpectedPath = '',
+        $ExpectedCreationDate = $null,
+        [int]$WaitMs = 2000
+    )
+    if ($ProcessId -le 0) { return $false }
+    $cur = Get-CimProcess -ProcessId $ProcessId
+    if (-not $cur) { return $true }
+
+    if ($ExpectedName -and $cur.Name -and ($cur.Name -ine $ExpectedName)) { return $false }
+    if ($ExpectedPath -and $cur.ExecutablePath -and -not (Test-SamePath $cur.ExecutablePath $ExpectedPath)) { return $false }
+    if ($ExpectedCreationDate -and $cur.CreationDate -and ($cur.CreationDate -ne $ExpectedCreationDate)) { return $false }
+
+    try {
+        Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+    } catch { }
+
+    $elapsed = 0
+    while ($elapsed -lt $WaitMs) {
+        $after = Get-CimProcess -ProcessId $ProcessId
+        if (-not $after) { return $true }
+        if ($ExpectedCreationDate -and $after.CreationDate -and ($after.CreationDate -ne $ExpectedCreationDate)) {
+            return $true
+        }
+        Start-Sleep -Milliseconds 150
+        $elapsed += 150
+    }
+    $final = Get-CimProcess -ProcessId $ProcessId
+    if (-not $final) { return $true }
+    if ($ExpectedCreationDate -and $final.CreationDate -and ($final.CreationDate -ne $ExpectedCreationDate)) { return $true }
+    return $false
+}
+
+function Stop-OwnPackageProcesses {
+    param(
+        [string]$Root = '',
+        [switch]$StopAdbServer,
+        [switch]$KeepAdbIfOtherGnirehtetRunning,
+        [switch]$SkipGnirehtet,
+        [switch]$Quiet
+    )
+
+    $Root = Resolve-PackageRoot -Root $Root
+    $p = Get-GnirehtetPaths -Root $Root
+    $adbPort = Get-AdbServerPort
+
+    $stoppedGn = New-Object System.Collections.Generic.List[int]
+    $stoppedAdb = New-Object System.Collections.Generic.List[int]
+    $remainingOwn = New-Object System.Collections.Generic.List[int]
+    $keptExternalAdb = $false
+    $skippedAdbForActiveSession = $false
+
+    # 1. 清理所有属于本包的 gnirehtet.exe（含 31416 端口监听者及无端口残留进程）
+    if (-not $SkipGnirehtet) {
+        $gnCandidates = @{}
+        foreach ($g in @(Get-GnirehtetProcessList)) {
+            if (Test-OwnGnirehtetProcEntry -ProcEntry $g -GnExePath $p.GnExe) {
+                $gnCandidates[$g.PID] = New-Object PSObject -Property @{
+                    PID          = $g.PID
+                    Name         = 'gnirehtet.exe'
+                    Path         = $g.Path
+                    CreationDate = $g.CreationDate
+                }
+            }
+        }
+        foreach ($s in @(Get-PortOwners -Port 31416 -ListenOnly)) {
+            if (-not $s.PID) { continue }
+            $isOwnPort = if ($s.Path) { Test-SamePath $s.Path $p.GnExe } else { ($s.Name -ieq 'gnirehtet.exe') }
+            if ($isOwnPort -and -not $gnCandidates.ContainsKey($s.PID)) {
+                $gnCandidates[$s.PID] = New-Object PSObject -Property @{
+                    PID          = $s.PID
+                    Name         = $s.Name
+                    Path         = $s.Path
+                    CreationDate = $s.CreationDate
+                }
+            }
+        }
+
+        foreach ($pidKey in $gnCandidates.Keys) {
+            $cand = $gnCandidates[$pidKey]
+            if (Stop-VerifiedProcessByIdentity -ProcessId $cand.PID -ExpectedName 'gnirehtet.exe' -ExpectedPath $p.GnExe -ExpectedCreationDate $cand.CreationDate -WaitMs 2000) {
+                $stoppedGn.Add([int]$cand.PID)
+            }
+        }
+    }
+
+    # 2. 按需清理本包 adb.exe（严格按路径匹配，绝不触碰外部工具的 adb.exe）
+    $otherGnRunning = @(@(Get-GnirehtetProcessList) | Where-Object { Test-OwnGnirehtetProcEntry -ProcEntry $_ -GnExePath $p.GnExe })
+    if ($StopAdbServer) {
+        if ($KeepAdbIfOtherGnirehtetRunning -and $otherGnRunning.Count -gt 0) {
+            $skippedAdbForActiveSession = $true
+        } else {
+            $portOwners = @(Get-PortOwners -Port $adbPort -ListenOnly)
+            $hasOwnPortAdb = $false
+            foreach ($po in $portOwners) {
+                if ($po.Name -ieq 'adb.exe') {
+                    if ($po.Path -and (Test-SamePath $po.Path $p.AdbExe)) {
+                        $hasOwnPortAdb = $true
+                    } else {
+                        $keptExternalAdb = $true
+                    }
+                }
+            }
+
+            if ($hasOwnPortAdb -and (Test-Path -LiteralPath $p.AdbExe -PathType Leaf)) {
+                try { Invoke-ProcessCapture -FilePath $p.AdbExe -Arguments @('kill-server') -TimeoutSeconds 8 | Out-Null } catch { }
+                $waited = 0
+                while ($waited -lt 2000) {
+                    $stillPort = @(Get-PortOwners -Port $adbPort -ListenOnly | Where-Object {
+                        $_.Name -ieq 'adb.exe' -and $_.Path -and (Test-SamePath $_.Path $p.AdbExe)
+                    })
+                    if ($stillPort.Count -eq 0) { break }
+                    Start-Sleep -Milliseconds 150
+                    $waited += 150
+                }
+                foreach ($po in $portOwners) {
+                    if ($po.Name -ieq 'adb.exe' -and $po.Path -and (Test-SamePath $po.Path $p.AdbExe)) {
+                        $curAfter = Get-CimProcess -ProcessId $po.PID
+                        if (-not $curAfter -or ($po.CreationDate -and $curAfter.CreationDate -ne $po.CreationDate)) {
+                            if (-not ($stoppedAdb.Contains([int]$po.PID))) { $stoppedAdb.Add([int]$po.PID) }
+                        } elseif (Stop-VerifiedProcessByIdentity -ProcessId $po.PID -ExpectedName 'adb.exe' -ExpectedPath $p.AdbExe -ExpectedCreationDate $po.CreationDate -WaitMs 2000) {
+                            if (-not ($stoppedAdb.Contains([int]$po.PID))) { $stoppedAdb.Add([int]$po.PID) }
+                        }
+                    }
+                }
+            }
+
+            # 扫描并清理所有精确匹配本包路径的残留 adb.exe（例如未监听的卡死进程或切换端口前的本包 adb）
+            if ($otherGnRunning.Count -eq 0) {
+                $ownAdbs = @(Get-AdbProcessList | Where-Object { $_.Path -and (Test-SamePath $_.Path $p.AdbExe) })
+                if (-not $hasOwnPortAdb -and $ownAdbs.Count -gt 0 -and (Test-Path -LiteralPath $p.AdbExe -PathType Leaf)) {
+                    try { Invoke-ProcessCapture -FilePath $p.AdbExe -Arguments @('kill-server') -TimeoutSeconds 5 | Out-Null } catch { }
+                    Start-Sleep -Milliseconds 250
+                }
+                foreach ($oa in $ownAdbs) {
+                    $curAdb = Get-CimProcess -ProcessId $oa.PID
+                    if (-not $curAdb -or ($oa.CreationDate -and $curAdb.CreationDate -ne $oa.CreationDate)) {
+                        if (-not ($stoppedAdb.Contains([int]$oa.PID))) { $stoppedAdb.Add([int]$oa.PID) }
+                    } elseif (Stop-VerifiedProcessByIdentity -ProcessId $oa.PID -ExpectedName 'adb.exe' -ExpectedPath $p.AdbExe -ExpectedCreationDate $oa.CreationDate -WaitMs 2000) {
+                        if (-not ($stoppedAdb.Contains([int]$oa.PID))) { $stoppedAdb.Add([int]$oa.PID) }
+                    }
+                }
+            }
+        }
+    }
+
+    # 3. 复查是否仍有本包残留进程
+    if (-not $SkipGnirehtet) {
+        foreach ($g in @(Get-GnirehtetProcessList)) {
+            if (Test-OwnGnirehtetProcEntry -ProcEntry $g -GnExePath $p.GnExe) {
+                if (-not ($remainingOwn.Contains([int]$g.PID))) { $remainingOwn.Add([int]$g.PID) }
+            }
+        }
+    }
+    if ($StopAdbServer -and -not $skippedAdbForActiveSession) {
+        foreach ($oa in @(Get-AdbProcessList)) {
+            if ($oa.Path -and (Test-SamePath $oa.Path $p.AdbExe)) {
+                if (-not ($remainingOwn.Contains([int]$oa.PID))) { $remainingOwn.Add([int]$oa.PID) }
+            }
+        }
+    }
+
+    if (-not $Quiet) {
+        if ($stoppedGn.Count -gt 0 -or $stoppedAdb.Count -gt 0) {
+            Write-Host ("[*] 已清理本包后台进程：gnirehtet={0}，adb={1}" -f ($stoppedGn.ToArray() -join ','), ($stoppedAdb.ToArray() -join ',')) -ForegroundColor DarkGray
+        }
+        if ($remainingOwn.Count -gt 0) {
+            Write-Host ("[注意] 仍有本包进程未能退出（PID：{0}）。" -f ($remainingOwn.ToArray() -join ', ')) -ForegroundColor Yellow
+        }
+    }
+
+    return (New-Object PSObject -Property @{
+        StoppedGnirehtetPids       = $stoppedGn.ToArray()
+        StoppedAdbPids             = $stoppedAdb.ToArray()
+        KeptExternalAdb            = $keptExternalAdb
+        SkippedAdbForActiveSession = $skippedAdbForActiveSession
+        RemainingOwnPids           = $remainingOwn.ToArray()
+        Clean                      = ($remainingOwn.Count -eq 0)
+    })
 }

@@ -12,21 +12,158 @@
 #>
 
 function Ensure-GnirehtetWatchdogNative {
-    if (('GnirehtetConsoleGuard' -as [type]) -and ('GnirehtetRelayRunner' -as [type])) {
+    if (('GnirehtetProcessJob' -as [type]) -and ('GnirehtetConsoleGuard' -as [type]) -and ('GnirehtetRelayRunner' -as [type])) {
         return $true
     }
     $src = @'
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
+using System.Threading;
+
+public static class GnirehtetProcessJob {
+    private const int JobObjectExtendedLimitInformation = 9;
+    private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+    private const uint PROCESS_TERMINATE = 0x0001;
+    private const uint PROCESS_SET_QUOTA = 0x0100;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
+        public long PerProcessUserTimeLimit;
+        public long PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize;
+        public UIntPtr MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass;
+        public uint SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IO_COUNTERS {
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount;
+        public ulong OtherTransferCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+        public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+        public IO_COUNTERS IoInfo;
+        public UIntPtr ProcessMemoryLimit;
+        public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed;
+        public UIntPtr PeakJobMemoryUsed;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateJobObject(IntPtr lpJobAttributes, string lpName);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetInformationJobObject(
+        IntPtr hJob,
+        int JobObjectInfoClass,
+        ref JOBOBJECT_EXTENDED_LIMIT_INFORMATION lpJobObjectInfo,
+        uint cbJobObjectInfoLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProcess);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr hObject);
+
+    private static readonly object _sync = new object();
+    private static IntPtr _sharedJob = IntPtr.Zero;
+
+    private static IntPtr EnsureSharedJobLocked() {
+        if (_sharedJob != IntPtr.Zero) {
+            return _sharedJob;
+        }
+        IntPtr job = CreateJobObject(IntPtr.Zero, null);
+        if (job == IntPtr.Zero) {
+            return IntPtr.Zero;
+        }
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION info = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        uint len = (uint)Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
+        if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, ref info, len)) {
+            CloseHandle(job);
+            return IntPtr.Zero;
+        }
+        _sharedJob = job;
+        return _sharedJob;
+    }
+
+    public static bool TryAssignProcessHandle(IntPtr hProcess) {
+        if (hProcess == IntPtr.Zero || hProcess == new IntPtr(-1)) {
+            return false;
+        }
+        try {
+            lock (_sync) {
+                IntPtr job = EnsureSharedJobLocked();
+                if (job == IntPtr.Zero) {
+                    return false;
+                }
+                return AssignProcessToJobObject(job, hProcess);
+            }
+        } catch {
+            return false;
+        }
+    }
+
+    public static bool TryAssignProcessId(int pid) {
+        if (pid <= 0) {
+            return false;
+        }
+        IntPtr hProc = IntPtr.Zero;
+        try {
+            hProc = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, pid);
+            if (hProc == IntPtr.Zero) {
+                return false;
+            }
+            return TryAssignProcessHandle(hProc);
+        } catch {
+            return false;
+        } finally {
+            if (hProc != IntPtr.Zero) {
+                try { CloseHandle(hProc); } catch { }
+            }
+        }
+    }
+
+    public static void CloseShared() {
+        lock (_sync) {
+            if (_sharedJob != IntPtr.Zero) {
+                try { CloseHandle(_sharedJob); } catch { }
+                _sharedJob = IntPtr.Zero;
+            }
+        }
+    }
+}
 
 public static class GnirehtetConsoleGuard {
     private const int STD_INPUT_HANDLE = -10;
     private const uint ENABLE_QUICK_EDIT_MODE = 0x0040;
     private const uint ENABLE_INSERT_MODE = 0x0020;
     private const uint ENABLE_EXTENDED_FLAGS = 0x0080;
+
+    private const uint CTRL_C_EVENT = 0;
+    private const uint CTRL_BREAK_EVENT = 1;
+    private const uint CTRL_CLOSE_EVENT = 2;
+    private const uint CTRL_LOGOFF_EVENT = 5;
+    private const uint CTRL_SHUTDOWN_EVENT = 6;
+
+    private delegate bool ConsoleCtrlDelegate(uint CtrlType);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern IntPtr GetStdHandle(int nStdHandle);
@@ -36,6 +173,29 @@ public static class GnirehtetConsoleGuard {
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetConsoleCtrlHandler(ConsoleCtrlDelegate HandlerRoutine, bool Add);
+
+    private static readonly ConsoleCtrlDelegate _handler = new ConsoleCtrlDelegate(OnConsoleCtrl);
+    private static readonly object _ctrlSync = new object();
+    private static readonly object _ctxSync = new object();
+    private static readonly ManualResetEvent _stopEvent = new ManualResetEvent(false);
+
+    private static bool _ctrlHandlerRegistered = false;
+    private static bool _processExitRegistered = false;
+    private static int _gracefulActive = 0;
+    private static int _stopRequested = 0;
+    private static int _ctrlCCount = 0;
+    private static int _emergencyRan = 0;
+
+    private static GnirehtetRelayRunner _runner = null;
+    private static string _gnExe = null;
+    private static string _adbExe = null;
+    private static string _toolsDir = null;
+    private static string _serial = null;
+    private static int _adbPort = 5037;
+    private static bool _shouldStopOwnAdb = false;
 
     public static bool DisableQuickEdit() {
         try {
@@ -54,6 +214,260 @@ public static class GnirehtetConsoleGuard {
             return SetConsoleMode(hIn, next);
         } catch {
             return false;
+        }
+    }
+
+    private static void EnsureHandlersRegisteredLocked() {
+        if (!_ctrlHandlerRegistered) {
+            try {
+                if (SetConsoleCtrlHandler(_handler, true)) {
+                    _ctrlHandlerRegistered = true;
+                }
+            } catch { }
+        }
+        if (!_processExitRegistered) {
+            try {
+                AppDomain.CurrentDomain.ProcessExit += new EventHandler(OnProcessExit);
+                _processExitRegistered = true;
+            } catch { }
+        }
+    }
+
+    private static void OnProcessExit(object sender, EventArgs e) {
+        bool hasWork = false;
+        lock (_ctxSync) {
+            hasWork = (_runner != null) || _shouldStopOwnAdb || (!string.IsNullOrEmpty(_gnExe) && !string.IsNullOrEmpty(_serial));
+        }
+        if (hasWork) {
+            RunEmergencyCleanup();
+        }
+    }
+
+    public static void EnableGracefulStop() {
+        lock (_ctrlSync) {
+            EnsureHandlersRegisteredLocked();
+        }
+        Interlocked.Exchange(ref _stopRequested, 0);
+        Interlocked.Exchange(ref _ctrlCCount, 0);
+        Interlocked.Exchange(ref _emergencyRan, 0);
+        _stopEvent.Reset();
+        Interlocked.Exchange(ref _gracefulActive, 1);
+    }
+
+    public static void DisableGracefulStop() {
+        Interlocked.Exchange(ref _gracefulActive, 0);
+    }
+
+    public static void ResetStop() {
+        Interlocked.Exchange(ref _stopRequested, 0);
+        Interlocked.Exchange(ref _ctrlCCount, 0);
+        _stopEvent.Reset();
+    }
+
+    public static void RequestStop() {
+        Interlocked.Exchange(ref _stopRequested, 1);
+        try { _stopEvent.Set(); } catch { }
+    }
+
+    public static bool IsStopRequested {
+        get { return Thread.VolatileRead(ref _stopRequested) == 1; }
+    }
+
+    public static bool WaitStop(int milliseconds) {
+        if (IsStopRequested) {
+            return true;
+        }
+        if (milliseconds <= 0) {
+            return IsStopRequested;
+        }
+        try {
+            if (_stopEvent.WaitOne(milliseconds, false)) {
+                return true;
+            }
+        } catch { }
+        return IsStopRequested;
+    }
+
+    public static void ConfigureShutdownCleanup(
+        GnirehtetRelayRunner runner,
+        string gnExe,
+        string adbExe,
+        string toolsDir,
+        string serial,
+        int adbPort,
+        bool shouldStopOwnAdb) {
+        lock (_ctrlSync) {
+            EnsureHandlersRegisteredLocked();
+        }
+        lock (_ctxSync) {
+            _runner = runner;
+            _gnExe = gnExe;
+            _adbExe = adbExe;
+            _toolsDir = toolsDir;
+            _serial = serial;
+            _adbPort = adbPort > 0 ? adbPort : 5037;
+            _shouldStopOwnAdb = shouldStopOwnAdb;
+        }
+        Interlocked.Exchange(ref _emergencyRan, 0);
+    }
+
+    public static void UpdateShutdownAdbOwnership(bool shouldStopOwnAdb, int adbPort) {
+        lock (_ctxSync) {
+            _shouldStopOwnAdb = shouldStopOwnAdb;
+            if (adbPort > 0) {
+                _adbPort = adbPort;
+            }
+        }
+    }
+
+    public static void ClearShutdownCleanup() {
+        lock (_ctxSync) {
+            _runner = null;
+            _gnExe = null;
+            _adbExe = null;
+            _toolsDir = null;
+            _serial = null;
+            _shouldStopOwnAdb = false;
+        }
+    }
+
+    private static bool OnConsoleCtrl(uint ctrlType) {
+        if (ctrlType == CTRL_C_EVENT || ctrlType == CTRL_BREAK_EVENT) {
+            if (Thread.VolatileRead(ref _gracefulActive) == 1) {
+                int count = Interlocked.Increment(ref _ctrlCCount);
+                if (count <= 2) {
+                    RequestStop();
+                    return true;
+                }
+                RunEmergencyCleanup();
+                return false;
+            }
+            return false;
+        }
+        if (ctrlType == CTRL_CLOSE_EVENT || ctrlType == CTRL_LOGOFF_EVENT || ctrlType == CTRL_SHUTDOWN_EVENT) {
+            RunEmergencyCleanup();
+            return false;
+        }
+        return false;
+    }
+
+    public static void RunEmergencyCleanup() {
+        if (Interlocked.Exchange(ref _emergencyRan, 1) != 0) {
+            return;
+        }
+
+        GnirehtetRelayRunner runner;
+        string gnExe;
+        string adbExe;
+        string toolsDir;
+        string serial;
+        int adbPort;
+        bool stopOwnAdb;
+
+        lock (_ctxSync) {
+            runner = _runner;
+            gnExe = _gnExe;
+            adbExe = _adbExe;
+            toolsDir = _toolsDir;
+            serial = _serial;
+            adbPort = _adbPort;
+            stopOwnAdb = _shouldStopOwnAdb;
+        }
+
+        if (runner != null) {
+            try { runner.Stop(); } catch { }
+        }
+
+        if (!string.IsNullOrEmpty(gnExe) && !string.IsNullOrEmpty(serial) && File.Exists(gnExe)) {
+            RunShortProcess(gnExe, "stop " + serial, toolsDir, adbPort, adbExe, 1500);
+        }
+
+        if (!string.IsNullOrEmpty(gnExe)) {
+            KillProcessesByExactPath("gnirehtet", gnExe);
+        }
+
+        if (stopOwnAdb && !string.IsNullOrEmpty(adbExe) && File.Exists(adbExe)) {
+            RunShortProcess(adbExe, "kill-server", toolsDir, adbPort, adbExe, 1500);
+            KillProcessesByExactPath("adb", adbExe);
+        }
+
+        GnirehtetProcessJob.CloseShared();
+    }
+
+    private static void RunShortProcess(string exe, string args, string workDir, int adbPort, string adbOverride, int timeoutMs) {
+        Process p = null;
+        try {
+            ProcessStartInfo psi = new ProcessStartInfo();
+            psi.FileName = exe;
+            psi.Arguments = args;
+            if (!string.IsNullOrEmpty(workDir) && Directory.Exists(workDir)) {
+                psi.WorkingDirectory = workDir;
+            }
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            if (adbPort > 0) {
+                psi.EnvironmentVariables["ANDROID_ADB_SERVER_PORT"] = adbPort.ToString();
+            }
+            if (!string.IsNullOrEmpty(adbOverride)) {
+                psi.EnvironmentVariables["ADB"] = adbOverride;
+            }
+            p = Process.Start(psi);
+            if (p != null) {
+                if (!p.WaitForExit(timeoutMs)) {
+                    try { p.Kill(); } catch { }
+                }
+            }
+        } catch {
+        } finally {
+            if (p != null) {
+                try { p.Dispose(); } catch { }
+            }
+        }
+    }
+
+    private static void KillProcessesByExactPath(string procBaseName, string expectedExePath) {
+        if (string.IsNullOrEmpty(expectedExePath)) {
+            return;
+        }
+        string targetFull;
+        try {
+            targetFull = Path.GetFullPath(expectedExePath);
+        } catch {
+            return;
+        }
+
+        Process[] procs = null;
+        try {
+            procs = Process.GetProcessesByName(procBaseName);
+        } catch {
+            return;
+        }
+        if (procs == null) {
+            return;
+        }
+        for (int i = 0; i < procs.Length; i++) {
+            Process proc = procs[i];
+            try {
+                if (proc.HasExited) {
+                    continue;
+                }
+                string modPath = null;
+                try {
+                    modPath = proc.MainModule != null ? proc.MainModule.FileName : null;
+                } catch {
+                    modPath = null;
+                }
+                if (string.IsNullOrEmpty(modPath)) {
+                    continue;
+                }
+                string full = Path.GetFullPath(modPath);
+                if (string.Equals(full, targetFull, StringComparison.OrdinalIgnoreCase)) {
+                    try { proc.Kill(); } catch { }
+                }
+            } catch {
+            } finally {
+                try { proc.Dispose(); } catch { }
+            }
         }
     }
 }
@@ -100,7 +514,10 @@ public class GnirehtetRelayRunner {
         if (!proc.Start()) {
             return false;
         }
-        _process = proc;
+        try {
+            GnirehtetProcessJob.TryAssignProcessHandle(proc.Handle);
+        } catch { }
+        _process = proc;;
         proc.BeginOutputReadLine();
         proc.BeginErrorReadLine();
         return true;
@@ -263,6 +680,50 @@ function Disable-ConsoleQuickEdit {
             return [GnirehtetConsoleGuard]::DisableQuickEdit()
         }
     } catch { }
+    return $false
+}
+
+function Register-ProcessInSessionJob {
+    param([int]$ProcessId)
+    if ($ProcessId -le 0) { return $false }
+    try {
+        if (Ensure-GnirehtetWatchdogNative) {
+            return [GnirehtetProcessJob]::TryAssignProcessId($ProcessId)
+        }
+    } catch { }
+    return $false
+}
+
+function Close-SessionProcessJob {
+    try {
+        if ('GnirehtetProcessJob' -as [type]) {
+            [GnirehtetProcessJob]::CloseShared()
+        }
+    } catch { }
+}
+
+function Test-OwnAdbOnCurrentPort {
+    param([string]$AdbExe)
+    if (-not $AdbExe) { return $null }
+    $port = if (Get-Command Get-AdbServerPort -ErrorAction SilentlyContinue) {
+        Get-AdbServerPort
+    } else {
+        5037
+    }
+    foreach ($po in @(Get-PortOwners -Port $port -ListenOnly)) {
+        if ($po.Name -ieq 'adb.exe' -and $po.Path -and (Test-SamePath $po.Path $AdbExe)) {
+            return $po
+        }
+    }
+    return $null
+}
+
+function Attach-OwnAdbServerToJob {
+    param([string]$AdbExe)
+    $po = Test-OwnAdbOnCurrentPort -AdbExe $AdbExe
+    if ($po -and $po.PID -gt 0) {
+        return (Register-ProcessInSessionJob -ProcessId $po.PID)
+    }
     return $false
 }
 
@@ -471,7 +932,11 @@ function Wait-ClientConnectedPolling {
         $Hooks = $null
     )
     $elapsed = 0
+    $hasGuard = [bool]('GnirehtetConsoleGuard' -as [type])
     while ($true) {
+        if ($hasGuard -and [GnirehtetConsoleGuard]::IsStopRequested) {
+            return $false
+        }
         Write-RelayImportantLines -RelayRunner $RelayRunner -Hooks $Hooks
         $connected = Invoke-WatchdogHook -Hooks $Hooks -Name 'TestClientConnected' -DefaultAction {
             param($p, $rr) Test-RelayClientConnected -Port $p -RelayRunner $rr
@@ -486,6 +951,11 @@ function Wait-ClientConnectedPolling {
         if ($Hooks -and $Hooks.ContainsKey('Sleep') -and $Hooks['Sleep']) {
             & $Hooks['Sleep'] 1
             $elapsed += 1000
+        } elseif ($hasGuard) {
+            if ([GnirehtetConsoleGuard]::WaitStop($waitNow)) {
+                return $false
+            }
+            $elapsed += $waitNow
         } else {
             Start-Sleep -Milliseconds $waitNow
             $elapsed += $waitNow
@@ -664,6 +1134,8 @@ function Invoke-GnirehtetWatchdog {
         [string]$ToolsDir,
         [string]$Serial,
         [string]$DeviceLabel = '',
+        [string]$Root = '',
+        [switch]$StopOwnAdbOnExit,
         [int]$Port = 31416,
         [int]$PollIntervalSeconds = 3,
         [int]$ClientGracePolls = 3,
@@ -675,7 +1147,22 @@ function Invoke-GnirehtetWatchdog {
     )
 
     if (-not $DeviceLabel) { $DeviceLabel = $Serial }
+    $effectiveRoot = $Root
+    if (-not $effectiveRoot -and $ToolsDir) {
+        try { $effectiveRoot = Split-Path -Parent (Split-Path -Parent $ToolsDir) } catch { $effectiveRoot = '' }
+    }
+    $adbPort = if (Get-Command Get-AdbServerPort -ErrorAction SilentlyContinue) { Get-AdbServerPort } else { 5037 }
+    $hasCustomStartRelay = ($Hooks -and $Hooks.ContainsKey('StartRelay') -and $Hooks['StartRelay'])
+    $hasCustomStopClient = ($Hooks -and $Hooks.ContainsKey('StopClient') -and $Hooks['StopClient'])
+
     Disable-ConsoleQuickEdit | Out-Null
+    $guardReady = $false
+    try {
+        $guardReady = Ensure-GnirehtetWatchdogNative
+        if ($guardReady) {
+            [GnirehtetConsoleGuard]::EnableGracefulStop()
+        }
+    } catch { $guardReady = $false }
 
     $getNow = {
         if ($Hooks -and $Hooks.ContainsKey('Now') -and $Hooks['Now']) {
@@ -687,16 +1174,27 @@ function Invoke-GnirehtetWatchdog {
         param([int]$Sec)
         if ($Hooks -and $Hooks.ContainsKey('Sleep') -and $Hooks['Sleep']) {
             & $Hooks['Sleep'] $Sec
+        } elseif ($guardReady) {
+            [GnirehtetConsoleGuard]::WaitStop($Sec * 1000) | Out-Null
         } else {
             Start-Sleep -Seconds $Sec
         }
     }
 
     $relayProc = $null
+    $lastState = 'starting'
     try {
         $relayProc = Invoke-WatchdogHook -Hooks $Hooks -Name 'StartRelay' -DefaultAction {
             param($g, $td, $p) Start-GnirehtetRelayProcess -GnExe $g -ToolsDir $td -Port $p
         } -Arguments @($GnExe, $ToolsDir, $Port)
+
+        if ($guardReady -and -not $hasCustomStartRelay) {
+            if ($StopOwnAdbOnExit) {
+                Attach-OwnAdbServerToJob -AdbExe $AdbExe | Out-Null
+            }
+            $runnerForGuard = if ($relayProc -is [GnirehtetRelayRunner]) { $relayProc } else { $null }
+            [GnirehtetConsoleGuard]::ConfigureShutdownCleanup($runnerForGuard, $GnExe, $AdbExe, $ToolsDir, $Serial, $adbPort, [bool]$StopOwnAdbOnExit)
+        }
 
         $relayAlive = Invoke-WatchdogHook -Hooks $Hooks -Name 'IsRelayAlive' -DefaultAction {
             param($pr) ($null -ne $pr -and $pr.IsRunning)
@@ -718,13 +1216,16 @@ function Invoke-GnirehtetWatchdog {
             Repair-GnirehtetConnection -GnExe $g -AdbExe $a -ToolsDir $td -Serial $s -Mode $m -Port $p -RelayRunner $rr -Hooks $h -Stabilize:$stab
         } -Arguments @($GnExe, $AdbExe, $ToolsDir, $Serial, 'initial', $Port, $relayProc, $Hooks, $false)
 
+        if ($guardReady -and $StopOwnAdbOnExit -and -not $hasCustomStartRelay) {
+            Attach-OwnAdbServerToJob -AdbExe $AdbExe | Out-Null
+        }
+
         Write-RelayImportantLines -RelayRunner $relayProc -Hooks $Hooks
         if (-not $initRes -or -not $initRes.Ok) {
             Write-Host '[提示] 首次启动客户端未完全就绪，守护循环将继续自动重试。' -ForegroundColor Yellow
         }
 
         $graceUntil = (& $getNow).AddSeconds($StartupGraceSeconds)
-        $lastState = 'starting'
         $hadDisconnect = $false
         $adbFailStreak = 0
         $offlineStreak = 0
@@ -738,8 +1239,10 @@ function Invoke-GnirehtetWatchdog {
         $pollCount = 0
 
         while ($MaxIterations -le 0 -or $pollCount -lt $MaxIterations) {
+            if ($guardReady -and [GnirehtetConsoleGuard]::IsStopRequested) { break }
             $pollCount++
             & $doSleep $PollIntervalSeconds
+            if ($guardReady -and [GnirehtetConsoleGuard]::IsStopRequested) { break }
             Write-RelayImportantLines -RelayRunner $relayProc -Hooks $Hooks
 
             # 统计 relay 关键状态变化（亚秒级闪断 & 流量存活）
@@ -790,6 +1293,10 @@ function Invoke-GnirehtetWatchdog {
                 $relayProc = Invoke-WatchdogHook -Hooks $Hooks -Name 'StartRelay' -DefaultAction {
                     param($g, $td, $p) Start-GnirehtetRelayProcess -GnExe $g -ToolsDir $td -Port $p
                 } -Arguments @($GnExe, $ToolsDir, $Port)
+                if ($guardReady -and -not $hasCustomStartRelay) {
+                    $runnerForGuard = if ($relayProc -is [GnirehtetRelayRunner]) { $relayProc } else { $null }
+                    [GnirehtetConsoleGuard]::ConfigureShutdownCleanup($runnerForGuard, $GnExe, $AdbExe, $ToolsDir, $Serial, $adbPort, [bool]$StopOwnAdbOnExit)
+                }
                 $hadDisconnect = $true
                 $trafficReported = $false
                 $lastDisconnectEvents = 0L
@@ -812,6 +1319,9 @@ function Invoke-GnirehtetWatchdog {
                         try { Invoke-ProcessCapture -FilePath $a -Arguments @('kill-server') -TimeoutSeconds 10 | Out-Null } catch { }
                         Initialize-AdbServer -AdbExe $a
                     } -Arguments @($AdbExe) | Out-Null
+                    if ($guardReady -and $StopOwnAdbOnExit -and -not $hasCustomStartRelay) {
+                        Attach-OwnAdbServerToJob -AdbExe $AdbExe | Out-Null
+                    }
                     $adbFailStreak = 0
                     $hadDisconnect = $true
                 }
@@ -906,6 +1416,9 @@ function Invoke-GnirehtetWatchdog {
                             try { Invoke-ProcessCapture -FilePath $a -Arguments @('kill-server') -TimeoutSeconds 10 | Out-Null } catch { }
                             Initialize-AdbServer -AdbExe $a
                         } -Arguments @($AdbExe) | Out-Null
+                        if ($guardReady -and $StopOwnAdbOnExit -and -not $hasCustomStartRelay) {
+                            Attach-OwnAdbServerToJob -AdbExe $AdbExe | Out-Null
+                        }
                         $repairFailStreak = 0
                     }
                 }
@@ -1006,6 +1519,9 @@ function Invoke-GnirehtetWatchdog {
                             try { Invoke-ProcessCapture -FilePath $a -Arguments @('kill-server') -TimeoutSeconds 10 | Out-Null } catch { }
                             Initialize-AdbServer -AdbExe $a
                         } -Arguments @($AdbExe) | Out-Null
+                        if ($guardReady -and $StopOwnAdbOnExit -and -not $hasCustomStartRelay) {
+                            Attach-OwnAdbServerToJob -AdbExe $AdbExe | Out-Null
+                        }
                         $repairFailStreak = 0
                     }
                 } else {
@@ -1019,18 +1535,53 @@ function Invoke-GnirehtetWatchdog {
         return 0
     } finally {
         Write-Host ''
-        Write-Host '[*] 正在收尾：停止本机转发与手机端反向网络……' -ForegroundColor DarkGray
+        Write-Host '[*] 正在收尾：停止本机转发、手机端反向网络与后台进程……' -ForegroundColor DarkGray
         try {
             Invoke-WatchdogHook -Hooks $Hooks -Name 'StopRelay' -DefaultAction {
                 param($pr) Stop-GnirehtetRelayProcess -Process $pr
             } -Arguments @($relayProc) | Out-Null
         } catch { }
         try {
-            Invoke-WatchdogHook -Hooks $Hooks -Name 'StopClient' -DefaultAction {
-                param($g, $td, $s)
-                Invoke-ProcessCapture -FilePath $g -Arguments @('stop', $s) -TimeoutSeconds 8 -WorkingDirectory $td | Out-Null
-            } -Arguments @($GnExe, $ToolsDir, $Serial) | Out-Null
-            Write-Host '[完成] 已停止，手机已恢复原有网络。' -ForegroundColor Green
+            if ($lastState -eq 'disconnected' -and -not $hasCustomStopClient) {
+                Write-Host '[*] 设备当前已断开，跳过手机端停止指令。' -ForegroundColor DarkGray
+            } else {
+                Invoke-WatchdogHook -Hooks $Hooks -Name 'StopClient' -DefaultAction {
+                    param($g, $td, $s)
+                    Invoke-ProcessCapture -FilePath $g -Arguments @('stop', $s) -TimeoutSeconds 5 -WorkingDirectory $td | Out-Null
+                } -Arguments @($GnExe, $ToolsDir, $Serial) | Out-Null
+                if (-not $hasCustomStopClient -and $AdbExe -and $Serial) {
+                    try {
+                        Invoke-ProcessCapture -FilePath $AdbExe -Arguments @('-s', $Serial, 'reverse', '--remove', 'localabstract:gnirehtet') -TimeoutSeconds 3 | Out-Null
+                    } catch { }
+                }
+            }
         } catch { }
+
+        $cleanupRes = $null
+        try {
+            $cleanupRes = Invoke-WatchdogHook -Hooks $Hooks -Name 'CleanupProcesses' -DefaultAction {
+                param($rootDir, $stopAdb)
+                if ($rootDir -and (Get-Command Stop-OwnPackageProcesses -ErrorAction SilentlyContinue)) {
+                    return (Stop-OwnPackageProcesses -Root $rootDir -StopAdbServer:$stopAdb -Quiet)
+                }
+                return $null
+            } -Arguments @($effectiveRoot, [bool]$StopOwnAdbOnExit)
+        } catch { }
+
+        if ($guardReady) {
+            try { [GnirehtetConsoleGuard]::ClearShutdownCleanup() } catch { }
+            try { [GnirehtetConsoleGuard]::DisableGracefulStop() } catch { }
+            if ($StopOwnAdbOnExit -and -not $hasCustomStartRelay) {
+                Close-SessionProcessJob
+            }
+        }
+
+        if ($cleanupRes -and $cleanupRes.RemainingOwnPids -and $cleanupRes.RemainingOwnPids.Count -gt 0) {
+            Write-Host ("[注意] 仍有本包后台进程未释放（PID：{0}），请确认是否有权限或稍后重试。" -f ($cleanupRes.RemainingOwnPids -join ', ')) -ForegroundColor Yellow
+        } elseif ($cleanupRes -and $cleanupRes.KeptExternalAdb) {
+            Write-Host '[完成] 已停止，手机已恢复原有网络（保留其它软件的 ADB 服务，本包进程已全部释放）。' -ForegroundColor Green
+        } else {
+            Write-Host '[完成] 已停止，手机已恢复原有网络，本包后台进程已全部释放。' -ForegroundColor Green
+        }
     }
 }
